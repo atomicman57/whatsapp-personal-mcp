@@ -7,6 +7,7 @@ from macos_contacts import contacts_app_status as macos_contacts_app_status
 from direct_sending import send_message, send_file, send_audio_message
 from replies import reply_message
 from workflow_reads import export_chat, list_chat_state, get_message_status, get_contact_details, list_new_messages, download_profile_photo
+from transfer_detector_status import get_transfer_detection_status
 from transcription import transcribe_audio_file as whisper_transcribe_audio_file
 from transcription import whisper_status as get_whisper_status
 from whatsapp import (
@@ -54,6 +55,7 @@ mcp.tool()(export_chat)
 mcp.tool()(list_chat_state)
 mcp.tool()(get_message_status)
 mcp.tool()(get_contact_details)
+mcp.tool()(get_transfer_detection_status)
 mcp.tool()(list_new_messages)
 mcp.tool()(download_profile_photo)
 

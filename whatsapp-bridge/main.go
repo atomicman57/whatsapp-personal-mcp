@@ -233,6 +233,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to secure store permissions: %v", err)
 	}
+	if err := initMessageChanges(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to initialize message change feed: %w", err)
+	}
 
 	return &MessageStore{db: db, storeDir: storeDir}, nil
 }
@@ -1210,6 +1214,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 	registerEventStreamHandler(mux, eventBroker)
 	registerReplyHandlers(mux, client, messageStore, eventBroker)
 	registerContactWorkflow(mux, client, messageStore)
+	registerDetectorReadHandlers(mux, client, messageStore)
 
 	// Health is read-only and reports both live connectivity and local cache age.
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {

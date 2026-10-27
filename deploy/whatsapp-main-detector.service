@@ -1,0 +1,20 @@
+[Unit]
+Description=Event-driven WhatsApp transfer-request intake
+Requires=docker.service whatsapp-main.service
+BindsTo=whatsapp-main.service
+PartOf=whatsapp-main.service
+After=docker.service whatsapp-main.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/whatsapp-main/images.env
+ExecStartPre=-/usr/bin/docker rm whatsapp-main-detector
+ExecStart=/usr/bin/docker run --name whatsapp-main-detector --init --network=container:whatsapp-main --user=10151:10151 --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=256m --cpus=0.5 --env-file=/etc/whatsapp-main/detector.env --mount=type=bind,src=/var/lib/whatsapp-main-detector/data,dst=/state --tmpfs=/tmp:rw,noexec,nosuid,size=32m --entrypoint=python ${WHATSAPP_IMAGE} /app/server/transfer_detector.py
+ExecStop=/usr/bin/docker stop --timeout=15 whatsapp-main-detector
+Restart=always
+RestartSec=3
+TimeoutStopSec=25
+
+[Install]
+WantedBy=whatsapp-main.service

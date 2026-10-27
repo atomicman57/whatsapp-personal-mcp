@@ -30,6 +30,9 @@ class StructuredReadTests(unittest.TestCase):
         override = patch.object(whatsapp, "MESSAGES_DB_PATH", str(self.database))
         override.start()
         self.addCleanup(override.stop)
+        bridge = patch.object(whatsapp, '_bridge_api_request', return_value={'success': False})
+        bridge.start()
+        self.addCleanup(bridge.stop)
 
     def test_keyset_export_same_timestamp_no_duplicates_and_no_writes(self):
         before = self.database.read_bytes()
@@ -67,6 +70,24 @@ class StructuredReadTests(unittest.TestCase):
         with patch.object(whatsapp, "MESSAGES_DB_PATH", str(missing)):
             self.assertEqual(workflow_reads.export_chat("15550000001@s.whatsapp.net")["code"], "history_unavailable")
         self.assertFalse(missing.exists())
+
+    def test_verified_lid_receipts_match_phone_message_without_cross_chat_leak(self):
+        pn='15550000001@s.whatsapp.net';lid='99900001@lid'
+        with sqlite3.connect(self.database) as db:
+            db.execute('DELETE FROM receipt_events')
+            db.execute('INSERT INTO receipt_events VALUES(?,?,?,?,?)',(lid,'c',lid,'read','2026-01-01T00:00:11Z'))
+            db.execute('INSERT INTO receipt_events VALUES(?,?,?,?,?)',('15550000002@s.whatsapp.net','c','other','played','2026-01-01T00:00:12Z'))
+        before=self.database.read_bytes()
+        mapping={'success':True,'data':{'jid':pn,'aliases':[pn,lid]}}
+        with patch.object(whatsapp,'_bridge_api_request',return_value=mapping):
+            result=workflow_reads.get_message_status(pn,'c')
+        self.assertEqual(result['status'],'read')
+        self.assertEqual(len(result['receipts']),1)
+        self.assertEqual(self.database.read_bytes(),before)
+        self.assertEqual(workflow_reads.get_message_status(pn,'c')['status'],'sent')
+        mapping['data']['aliases']=[pn,'15550000002@s.whatsapp.net']
+        with patch.object(whatsapp,'_bridge_api_request',return_value=mapping):
+            self.assertEqual(workflow_reads.get_message_status(pn,'c')['status'],'sent')
 
     def test_profile_photo_never_fetches_untrusted_url(self):
         with patch.object(workflow_reads, "get_contact_details", return_value={"success": True,

@@ -186,21 +186,43 @@ def export_chat(chat_jid: str, cursor: Optional[str] = None,
             "coverage": "linked_device_cache_only", "read_only": True}
 
 
+def _receipt_aliases(chat_jid: str) -> list[str]:
+    """Use the device's verified PN/LID mapping, never equal-looking digits."""
+    aliases = [chat_jid]
+    if not chat_jid.endswith(('@s.whatsapp.net', '@lid')):
+        return aliases
+    result = whatsapp._bridge_api_request('GET', 'contact/aliases', params={'jid': chat_jid})
+    data = result.get('data', {}) if result.get('success') else {}
+    values = data.get('aliases', [])
+    if data.get('jid') != chat_jid or not isinstance(values, list) or len(values) > 2 or chat_jid not in values:
+        return aliases
+    other_suffix = '@lid' if chat_jid.endswith('@s.whatsapp.net') else '@s.whatsapp.net'
+    for value in values:
+        try:
+            if value != chat_jid and value.endswith(other_suffix) and canonical_recipient(value) == value:
+                aliases.append(value)
+        except (ValueError, AttributeError):
+            continue
+    return aliases
+
+
 def get_message_status(chat_jid: str, message_id: str) -> Dict[str, Any]:
     """Read observed delivery/read status and receipt timestamps from the local cache.
 
     Missing receipts mean unknown. Group receipts identify the recipient that
     acknowledged; one person's read receipt does not mean everyone read it.
     """
+    aliases = _receipt_aliases(chat_jid)
+    slots = ','.join('?' for _ in aliases)
     try:
         with sqlite3.connect(Path(whatsapp.MESSAGES_DB_PATH).resolve().as_uri() + "?mode=ro", uri=True) as db:
             db.row_factory = sqlite3.Row
-            message = db.execute("SELECT status, CAST(timestamp AS TEXT) AS timestamp, is_from_me FROM messages WHERE chat_jid=? AND id=?",
-                                 (chat_jid, message_id)).fetchone()
+            message = db.execute("SELECT status, CAST(timestamp AS TEXT) AS timestamp, is_from_me FROM messages WHERE chat_jid IN (" + slots + ") AND id=? ORDER BY chat_jid=? DESC",
+                                 (*aliases, message_id, chat_jid)).fetchone()
             if message is None:
                 return {"success": False, "code": "message_not_found"}
-            receipts = db.execute("SELECT status, recipient_jid, timestamp FROM receipt_events WHERE chat_jid=? AND message_id=? ORDER BY timestamp",
-                                  (chat_jid, message_id)).fetchall()
+            receipts = db.execute("SELECT DISTINCT status, recipient_jid, timestamp FROM receipt_events WHERE chat_jid IN (" + slots + ") AND message_id=? ORDER BY timestamp",
+                                  (*aliases, message_id)).fetchall()
     except sqlite3.Error:
         return {"success": False, "code": "status_unavailable"}
     ranks = {"sent": 1, "delivered": 2, "read": 3, "played": 4}

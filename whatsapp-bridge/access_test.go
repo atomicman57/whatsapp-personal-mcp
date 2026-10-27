@@ -49,3 +49,31 @@ func TestBridgeAccessGuardsDirectRESTCalls(t *testing.T) {
 		})
 	}
 }
+
+func TestBridgeReadTokenNeverAuthorizesWrites(t *testing.T) {
+	t.Setenv("WHATSAPP_BRIDGE_TOKEN", strings.Repeat("w", 32))
+	t.Setenv("WHATSAPP_BRIDGE_READ_TOKEN", strings.Repeat("r", 32))
+	t.Setenv("WHATSAPP_SEND_ENABLED", "true")
+	t.Setenv("WHATSAPP_MUTATIONS_ENABLED", "true")
+	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"} {
+		r := httptest.NewRequest(method, "/api/message-changes?after_sequence=0", nil)
+		r.Header.Set("Authorization", "Bearer "+strings.Repeat("r", 32))
+		w := httptest.NewRecorder()
+		protectBridgeAccess(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })).ServeHTTP(w, r)
+		want := 403
+		if method == "GET" || method == "HEAD" {
+			want = 204
+		}
+		if w.Code != want {
+			t.Fatalf("%s: got %d, want %d", method, w.Code, want)
+		}
+	}
+	r := httptest.NewRequest("GET", "/api/health", nil)
+	r.Header.Add("Authorization", "Bearer "+strings.Repeat("r", 32))
+	r.Header.Add("Authorization", "Bearer "+strings.Repeat("w", 32))
+	w := httptest.NewRecorder()
+	protectBridgeAccess(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Fatal("duplicate authorization accepted") })).ServeHTTP(w, r)
+	if w.Code != 401 {
+		t.Fatal("duplicate headers not rejected")
+	}
+}

@@ -23,8 +23,15 @@ func protectBridgeAccess(next http.Handler) http.Handler {
 			return
 		}
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		readToken := os.Getenv("WHATSAPP_BRIDGE_READ_TOKEN")
+		fullAccess := subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+		readAccess := len(readToken) >= 32 && subtle.ConstantTimeCompare([]byte(provided), []byte(readToken)) == 1
+		if len(r.Header.Values("Authorization")) != 1 || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || (!fullAccess && !readAccess) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !fullAccess && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Read-only credential", http.StatusForbidden)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")

@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, List, Tuple
 import os
 import requests
 import json
+import re
 import audio
 from macos_contacts import search_macos_contacts
 
@@ -63,7 +64,7 @@ class Chat:
 
 @dataclass
 class Contact:
-    phone_number: str
+    phone_number: Optional[str]
     name: Optional[str]
     jid: Optional[str]
     source: str = "whatsapp"
@@ -322,10 +323,9 @@ def list_messages(
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
             
-            return format_messages_list(messages_with_context, show_chat_info=True)
+            return messages_with_context
             
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+        return result
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -445,14 +445,16 @@ def list_chats(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["""
+        last_fields = (
+            "messages.content, messages.sender, messages.is_from_me" if include_last_message
+            else "NULL, NULL, NULL"
+        )
+        query_parts = [f"""
             SELECT 
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_fields}
             FROM chats
         """]
         
@@ -506,8 +508,8 @@ def list_chats(
             conn.close()
 
 
-def _normalize_phone_number(phone_number: str) -> str:
-    digits = "".join(character for character in phone_number if character.isdigit())
+def _normalize_phone_number(phone_number: Optional[str]) -> str:
+    digits = "".join(character for character in (phone_number or "") if character.isdigit())
     if digits.startswith("00"):
         digits = digits[2:]
     return digits
@@ -539,7 +541,9 @@ def _search_whatsapp_contacts(query: str) -> List[Contact]:
         result = []
         for contact_data in contacts:
             contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
+                # A numeric LID is an opaque WhatsApp identifier, not a phone.
+                phone_number=(contact_data[0].split('@')[0]
+                              if contact_data[0].endswith('@s.whatsapp.net') else None),
                 name=contact_data[1],
                 jid=contact_data[0],
                 source="whatsapp",
@@ -567,6 +571,7 @@ def search_contacts(query: str) -> List[Contact]:
         for contact in whatsapp_contacts
         if _normalize_phone_number(contact.phone_number)
     }
+    unresolved = [contact for contact in whatsapp_contacts if not contact.phone_number]
 
     for macos_contact in macos_contacts:
         raw_phone_number = macos_contact.get("phone_number") or ""
@@ -592,8 +597,8 @@ def search_contacts(query: str) -> List[Contact]:
         )
 
     return sorted(
-        merged_by_phone.values(),
-        key=lambda contact: ((contact.name or "").lower(), contact.phone_number),
+        [*merged_by_phone.values(), *unresolved],
+        key=lambda contact: ((contact.name or "").lower(), contact.phone_number or contact.jid or ""),
     )[:50]
 
 
@@ -607,7 +612,7 @@ def search_contacts_chats_and_groups(query: str, limit: int = 50) -> List[Dict[s
 
     for chat in chats:
         item_type = "group" if chat.is_group else "direct_chat"
-        phone_number = chat.jid.split("@", 1)[0] if not chat.is_group else None
+        phone_number = chat.jid.split("@", 1)[0] if chat.jid.endswith("@s.whatsapp.net") else None
         results.append({
             "type": item_type,
             "jid": chat.jid,
@@ -747,14 +752,16 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        query = """
+        last_fields = (
+            "m.content, m.sender, m.is_from_me" if include_last_message
+            else "NULL, NULL, NULL"
+        )
+        query = f"""
             SELECT 
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                {last_fields}
             FROM chats c
         """
         
@@ -791,6 +798,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
+    if not re.fullmatch(r"\+?[1-9][0-9]{5,14}", sender_phone_number):
+        return None
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -806,9 +815,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid = ?
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, (sender_phone_number.lstrip("+") + "@s.whatsapp.net",))
         
         chat_data = cursor.fetchone()
         

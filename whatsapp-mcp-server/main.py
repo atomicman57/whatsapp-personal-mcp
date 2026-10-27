@@ -1,4 +1,6 @@
 import os
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from typing import List, Dict, Any, Callable, Optional
 from mcp.server.fastmcp import FastMCP
 from macos_contacts import contacts_app_status as macos_contacts_app_status
@@ -51,6 +53,19 @@ MAX_PAGE_NUMBER = 1_000
 MAX_CONTEXT_MESSAGES = 50
 
 
+def _structured(value):
+    """Convert cache dataclasses to the dictionaries advertised by MCP schemas."""
+    if is_dataclass(value):
+        return _structured(asdict(value))
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _structured(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_structured(item) for item in value]
+    return value
+
+
 def _clamp_integer(value: int, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -79,6 +94,9 @@ def set_contact_name(phone_number: str, name: str) -> Dict[str, Any]:
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search known WhatsApp chats and optional macOS Contacts.app entries.
+
+    Opaque LID candidates retain their JID and a null phone_number. Resolve them
+    using get_contact_details; never interpret the LID's digits as a phone.
     
     Args:
         query: Search term to match against contact names or phone numbers
@@ -86,7 +104,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return _structured(contacts)
 
 
 @mcp.tool()
@@ -267,7 +285,7 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    return _structured(messages)
 
 @mcp.tool()
 def list_chats(
@@ -295,10 +313,10 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return _structured(chats)
 
 @mcp.tool()
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
+def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[str, Any]]:
     """Get WhatsApp chat metadata by JID.
     
     Args:
@@ -306,17 +324,17 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return _structured(chat)
 
 @mcp.tool()
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
+def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, Any]]:
     """Get WhatsApp chat metadata by sender phone number.
     
     Args:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return _structured(chat)
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -330,7 +348,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     limit = _clamp_integer(limit, 20, 1, MAX_PAGE_SIZE)
     page = _clamp_integer(page, 0, 0, MAX_PAGE_NUMBER)
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return _structured(chats)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -358,7 +376,7 @@ def get_message_context(
     before = _clamp_integer(before, 5, 0, MAX_CONTEXT_MESSAGES)
     after = _clamp_integer(after, 5, 0, MAX_CONTEXT_MESSAGES)
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return _structured(context)
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

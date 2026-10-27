@@ -226,7 +226,7 @@ class ContactSearchTests(unittest.TestCase):
         with mock.patch.object(
             main, "whatsapp_search_contacts", return_value=contacts
         ) as search_contacts:
-            self.assertIs(main.search_contacts("Known Person"), contacts)
+            self.assertEqual(main.search_contacts("Known Person"), contacts)
 
         search_contacts.assert_called_once_with("Known Person")
 

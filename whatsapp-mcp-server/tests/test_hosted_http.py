@@ -38,8 +38,12 @@ class HostedTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.post(path, headers=headers, content=data)
                 self.assertEqual(response.status_code, status)
                 self.assertEqual(response.headers['cache-control'], 'no-store')
+                self.assertEqual(response.headers['strict-transport-security'], 'max-age=31536000')
             self.assertEqual(reached, [])
-            self.assertEqual((await client.post('/mcp', headers={'Authorization': 'Bearer ' + TOKEN}, content=b'{}')).status_code, 200)
+            accepted = await client.post('/mcp', headers={'Authorization': 'Bearer ' + TOKEN}, content=b'{}')
+            self.assertEqual(accepted.status_code, 200)
+            self.assertEqual(accepted.headers['cache-control'], 'no-store')
+            self.assertEqual(accepted.headers['strict-transport-security'], 'max-age=31536000')
             self.assertEqual(len(reached), 1)
             self.assertEqual(reached[0]['body'], b'{}')
 

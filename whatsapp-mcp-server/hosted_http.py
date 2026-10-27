@@ -29,6 +29,18 @@ class HostedApp:
         await send({"type": "http.response.body", "body": b"Request refused"})
 
     async def __call__(self, scope, receive, send):
+        original_send = send
+
+        async def private_send(message):
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", [])
+                           if k.lower() not in (b"cache-control", b"strict-transport-security")]
+                headers += [(b"cache-control", b"no-store"),
+                            (b"strict-transport-security", b"max-age=31536000")]
+                message = {**message, "headers": headers}
+            await original_send(message)
+
+        send = private_send
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return

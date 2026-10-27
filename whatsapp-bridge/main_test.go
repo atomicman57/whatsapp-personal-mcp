@@ -91,6 +91,16 @@ func TestPairingIdentityMatchesHostPlatform(t *testing.T) {
 	}
 }
 
+func TestPhonePairingUsesRecognizedBrowserDisplay(t *testing.T) {
+	for goos, want := range map[string]string{
+		"darwin": "Chrome (Mac OS)", "windows": "Chrome (Windows)", "linux": "Chrome (Linux)",
+	} {
+		if got := identityForOS(goos).clientDisplay; got != want {
+			t.Errorf("phone pairing display for %s = %q, want recognized %q", goos, got, want)
+		}
+	}
+}
+
 func TestImageOpenCommandMatchesHostPlatform(t *testing.T) {
 	tests := map[string]string{
 		"darwin":  "open",

@@ -72,6 +72,8 @@ Runtime commands take `--config /absolute/path/to/deployment.json`:
 
 - `bridge`: keep the API running; an unpaired account reports disconnected and does not generate pairing credentials.
 - `pair`: interactive owner pairing. Never redirect pairing output into logs.
+
+For phone-code linking, run `python3 scripts/personal_runtime.py pair --config /path/to/private-deployment.json --phone +COUNTRYCODEANDNUMBER` in an owner terminal. Enter its short-lived code in WhatsApp's Linked Devices → Link a Device → Link with phone number instead. Phone pairing uses a recognized browser/OS display because WhatsApp rejects custom application labels. Use a separate store, instance ID and ports when testing another account.
 - `mcp`: serve MCP over stdio.
 - `health`: show sanitized connectivity and coverage information.
 

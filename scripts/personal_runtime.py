@@ -14,7 +14,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("bridge", "pair", "mcp", "http", "health"))
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--phone", help="International phone number for interactive phone-code pairing")
     args = parser.parse_args()
+    if args.phone and args.mode != "pair":
+        parser.error("--phone is only supported for interactive pairing")
     config = json.loads(args.config.read_text())
     # Capture the owning helper's stdout in memory; never print the secret or
     # place it in argv, a launchd plist, a Grokbot configuration or a log file.
@@ -54,6 +57,8 @@ def main():
             command.append("--no-pair")
         elif not sys.stdin.isatty():
             raise SystemExit("Pairing requires an interactive owner terminal; pairing codes must not be logged")
+        elif args.phone:
+            command += ["--phone", args.phone]
     os.execve(command[0], command, env)
 
 

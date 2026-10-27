@@ -1552,13 +1552,15 @@ type pairingIdentity struct {
 }
 
 func identityForOS(goos string) pairingIdentity {
+	// PairPhone's display value is server-validated as a known Browser (OS).
+	// Custom application names are rejected with 400 bad-request.
 	switch goos {
 	case "darwin":
-		return pairingIdentity{"macOS", whatsmeow.PairClientMacOS, "WhatsApp MCP (macOS)"}
+		return pairingIdentity{"macOS", whatsmeow.PairClientMacOS, "Chrome (Mac OS)"}
 	case "windows":
-		return pairingIdentity{"Windows", whatsmeow.PairClientUWP, "WhatsApp MCP (Windows)"}
+		return pairingIdentity{"Windows", whatsmeow.PairClientUWP, "Chrome (Windows)"}
 	default:
-		return pairingIdentity{"Linux", whatsmeow.PairClientChrome, "WhatsApp MCP (Linux)"}
+		return pairingIdentity{"Linux", whatsmeow.PairClientChrome, "Chrome (Linux)"}
 	}
 }
 

@@ -1376,9 +1376,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 		return nil, fmt.Errorf("failed to listen on %s: %w", serverAddr, err)
 	}
 
+	recipientLookup := deviceRecipientLookup(client)
+	registerRecipientPolicyRead(mux, recipientLookup)
 	server := &http.Server{
 		Addr:              serverAddr,
-		Handler:           protectLoopbackAPI(protectBridgeAccess(mux), configuredMaxBridgeRequestBodyBytes()),
+		Handler:           protectLoopbackAPI(protectBridgeAccess(mux, recipientLookup), configuredMaxBridgeRequestBodyBytes()),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

@@ -18,6 +18,7 @@ class AutomaticSendTests(unittest.TestCase):
         env = patch.dict(os.environ, {
             "WHATSAPP_SEND_ENABLED": "true", "WHATSAPP_STORE_DIR": self.directory.name,
             "WHATSAPP_SEND_ALLOWLIST": "", "WHATSAPP_DO_NOT_CONTACT": "",
+            "WHATSAPP_SEND_SAVED_CONTACTS":"false","WHATSAPP_DO_NOT_CONTACT_NAMES":"",
         })
         env.start()
         self.addCleanup(env.stop)
@@ -68,6 +69,20 @@ class AutomaticSendTests(unittest.TestCase):
         with patch.dict(os.environ, {"WHATSAPP_SEND_ALLOWLIST": "15550000002"}):
             self.assertEqual(self.send()["code"], "recipient_denied")
         self.execute.assert_not_called()
+
+    def test_saved_contact_preflight_and_failure_happen_before_journal(self):
+        with patch.dict(os.environ,{'WHATSAPP_SEND_SAVED_CONTACTS':'true','WHATSAPP_SEND_ALLOWLIST':'15550000009'}):
+            with patch('whatsapp._bridge_api_request',return_value={'success':True,'data':{'allowed':False}}):
+                self.assertEqual(self.send()['code'],'recipient_denied')
+            self.execute.assert_not_called()
+            self.assertFalse((Path(self.directory.name)/'outbound-journal.sqlite').exists())
+            with patch('whatsapp._bridge_api_request',return_value={'success':False}):
+                self.assertEqual(self.send()['code'],'recipient_policy_unavailable')
+            self.assertFalse((Path(self.directory.name)/'outbound-journal.sqlite').exists())
+            with patch('whatsapp._bridge_api_request',return_value={'success':True,'data':{'allowed':True}}) as lookup:
+                self.assertTrue(self.send()['success']);self.assertTrue(self.send()['replayed'])
+                self.execute.assert_called_once()
+                lookup.assert_called_with('GET','recipient/policy',params={'recipient':'15550000001@s.whatsapp.net'},timeout=10)
 
     def test_unknown_lid_and_group_fail_closed_with_denylist(self):
         with patch.dict(os.environ, {"WHATSAPP_DO_NOT_CONTACT": "15550000002"}):

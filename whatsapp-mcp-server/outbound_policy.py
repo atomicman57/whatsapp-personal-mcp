@@ -39,14 +39,27 @@ def perform_send(kind: str, recipient: str, request_id: str, payload: Dict[str, 
         allowed = configured_recipients("WHATSAPP_SEND_ALLOWLIST")
     except ValueError as error:
         return {"success": False, "code": "invalid_recipient_policy", "message": str(error)}
-    if target in blocked or (allowed and target not in allowed):
+    if target in blocked:
+        return {"success": False, "code": "recipient_denied"}
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", request_id):
+        return {"success": False, "code": "invalid_request_id"}
+    directory_policy = (os.environ.get("WHATSAPP_SEND_SAVED_CONTACTS", "").lower()=="true"
+                        or bool(os.environ.get("WHATSAPP_DO_NOT_CONTACT_NAMES", "")))
+    if directory_policy:
+        # The bridge owns verified aliases and saved-contact metadata. Check it
+        # before reserving an outbound ID, then enforce again at dispatch time.
+        import whatsapp
+        policy = whatsapp._bridge_api_request("GET", "recipient/policy", params={"recipient":target}, timeout=10)
+        if not policy.get("success"):
+            return {"success": False, "code": "recipient_policy_unavailable"}
+        if policy.get("data",{}).get("allowed") is not True:
+            return {"success": False, "code": "recipient_denied"}
+    elif allowed and target not in allowed:
         return {"success": False, "code": "recipient_denied"}
     # A phone-only deny list cannot safely decide whether a LID or group contains
     # the same person. Require an explicit allowlist decision for those addresses.
-    if blocked and not target.endswith("@s.whatsapp.net") and target not in allowed:
+    if not directory_policy and blocked and not target.endswith("@s.whatsapp.net") and target not in allowed:
         return {"success": False, "code": "recipient_identity_unverified"}
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", request_id):
-        return {"success": False, "code": "invalid_request_id"}
     digest = hashlib.sha256(json.dumps(
         {"kind": kind, "recipient": target, "payload": payload},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,

@@ -57,6 +57,14 @@ class ClassifierTests(unittest.TestCase):
         code=message(2,'Your Access Code: 123456; please send NGN 5000')
         self.assertIsNone(classify(code))
         self.assertEqual(safe_context([code])[0],[])
+    def test_owner_dry_run_split_details_stay_separate_from_real_requests(self):
+        account=message(1,TEST_PREFIX+' 0123456789')
+        bank=message(2,TEST_PREFIX+' Sterling Demo Beneficiary')
+        result=classify(bank,[account,bank],dry_run=True)
+        self.assertEqual(result['account_number_candidates'],['0123456789'])
+        self.assertEqual(result['anchor_message_id'],account['id'])
+        self.assertIsNone(classify(message(3,'1900'),[account,bank]))
+        self.assertIsNone(classify(message(4,TEST_PREFIX+' 1900'),[message(1,'Please send NGN 5000')],dry_run=True))
     def test_account_leading_zero_amount_units_and_unknown_currency(self):
         result=classify(message())
         self.assertEqual(result['account_number_candidates'],['0123456789'])

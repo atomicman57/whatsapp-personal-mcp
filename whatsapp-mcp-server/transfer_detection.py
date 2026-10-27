@@ -22,7 +22,7 @@ TOTAL = re.compile(r'\b(?:total|balance|amount)\s*[:=\-]*\s*(\d[\d,]*(?:\.\d{1,2
 def account_clues(text):
     return list(dict.fromkeys(re.sub(r'\D','',x) for x in ACCOUNT.findall(text)))[:10]
 
-def recent_context(source,context):
+def recent_context(source,context,dry_run=False):
     """Only preceding same-chat evidence in a short request conversation window."""
     result=[]
     for row in context:
@@ -31,7 +31,11 @@ def recent_context(source,context):
             age=datetime.fromisoformat(source['timestamp'].replace('Z','+00:00'))-datetime.fromisoformat(row['timestamp'].replace('Z','+00:00'))
             if not timedelta(0)<=age<=timedelta(hours=2):continue
         except (ValueError,TypeError,KeyError):continue
-        if not sensitive(row.get('content','')) and not SYNTHETIC.search(row.get('content','')):result.append(row)
+        body=row.get('content') or ''
+        if dry_run:
+            if not body.startswith(TEST_PREFIX):continue
+            body=body[len(TEST_PREFIX):]
+        if not sensitive(body) and not SYNTHETIC.search(body):result.append({**row,'content':body})
     return result
 
 def amount_clues(text):
@@ -71,7 +75,7 @@ def classify(source,context=(),dry_run=False):
     if text.startswith(TEST_PREFIX):
         if not dry_run:return None
         text=text[len(TEST_PREFIX):]
-    context=recent_context(source,context)
+    context=recent_context(source,context,dry_run)
     prior=[]
     for row in reversed(context):
         if row.get('id')==source.get('id'):continue

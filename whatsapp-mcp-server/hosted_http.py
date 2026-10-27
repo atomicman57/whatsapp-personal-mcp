@@ -8,7 +8,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 
 class HostedApp:
-    def __init__(self, app, public_url, token):
+    def __init__(self, app, public_url, token, oauth=False):
         url = urlsplit(public_url)
         if (url.scheme != "https" or not url.hostname or url.username or url.password
                 or url.path not in ("", "/") or url.query or url.fragment
@@ -19,6 +19,14 @@ class HostedApp:
         self.app = app
         self.hosts = {url.hostname.lower(), url.hostname.lower() + ":443"}
         self.authorization = ("Bearer " + token).encode("ascii")
+        self.origin = public_url.rstrip("/")
+        self.oauth = oauth
+        self.oauth_paths = {
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/register", "/authorize", "/token", "/revoke", "/owner/authorize",
+        }
 
     @staticmethod
     async def reject(send, status):
@@ -50,16 +58,24 @@ class HostedApp:
         values = {}
         for key, value in scope.get("headers", []):
             values.setdefault(key.lower(), []).append(value)
+        origin = values.get(b"origin", [])
+        owner_form = self.oauth and scope.get("path") == "/owner/authorize"
         if (len(values.get(b"host", [])) != 1
                 or values[b"host"][0].decode("ascii", "replace").lower() not in self.hosts
-                or b"origin" in values or b"forwarded" in values):
+                or (origin and (not owner_form or origin != [self.origin.encode("ascii")]))
+                or b"forwarded" in values):
             await self.reject(send, 403)
             return
         auth = values.get(b"authorization", [])
-        if len(auth) != 1 or not secrets.compare_digest(auth[0], self.authorization):
+        if not self.oauth and (len(auth) != 1 or not secrets.compare_digest(auth[0], self.authorization)):
             await self.reject(send, 401)
             return
-        if scope.get("path") not in ("/mcp", "/mcp/") or scope.get("query_string"):
+        if self.oauth and len(auth) > 1:
+            await self.reject(send, 401)
+            return
+        mcp_path = scope.get("path") in ("/mcp", "/mcp/")
+        if ((not mcp_path and (not self.oauth or scope.get("path") not in self.oauth_paths))
+                or (mcp_path and scope.get("query_string"))):
             await self.reject(send, 404)
             return
         # Buffer at most 1 MiB before MCP parsing, including chunked requests.
@@ -90,7 +106,10 @@ class HostedApp:
 def run_hosted_http(mcp, port):
     public_url = os.environ.get("WHATSAPP_MCP_PUBLIC_URL", "")
     token = os.environ.get("WHATSAPP_MCP_TOKEN", "")
-    app = HostedApp(None, public_url, token)
+    oauth = os.environ.get("WHATSAPP_MCP_OAUTH_ENABLED", "").lower() == "true"
+    if oauth and mcp.settings.auth is None:
+        raise ValueError("OAuth mode requires the SDK authorization provider")
+    app = HostedApp(None, public_url, token, oauth=oauth)
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True, allowed_hosts=sorted(app.hosts), allowed_origins=[])
     # Configure before constructing the SDK's lazily cached session manager.

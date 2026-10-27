@@ -34,8 +34,17 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# Initialize the SDK authorization server only for explicitly hosted OAuth use.
+if os.environ.get("WHATSAPP_MCP_OAUTH_ENABLED", "").lower() == "true":
+    from owner_oauth import configure_oauth
+    oauth_provider, oauth_settings = configure_oauth()
+    mcp = FastMCP("whatsapp", auth_server_provider=oauth_provider, auth=oauth_settings)
+
+    @mcp.custom_route("/owner/authorize", methods=["GET", "POST"])
+    async def owner_authorization(request):
+        return await oauth_provider.owner_authorize(request)
+else:
+    mcp = FastMCP("whatsapp")
 
 mcp.tool()(reply_message)
 mcp.tool()(send_message)

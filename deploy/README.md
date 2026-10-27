@@ -13,3 +13,13 @@ Before moving a linked account, stop its local bridge and MCP services. Transfer
 The send allowlist and do-not-contact list are server-side runtime configuration. Start with a self-only allowlist until account routing and the current exclusion list have been verified. Account mutations remain a separate capability. Persist all state under the host volume; a container's ephemeral root filesystem is not a database backup.
 
 Before enabling broader use, test unauthenticated/incorrect-token rejection, authenticated MCP initialization, exact own identity, a self-chat text/reply/attachment, duplicate replay across a service restart and server-to-WhatsApp connectivity while laptop services are stopped. Distinguish provider acceptance from delivery and read receipts.
+
+## OAuth connections for agent clients
+
+Set `WHATSAPP_MCP_OAUTH_ENABLED=true` to enable the MCP SDK's OAuth authorization-server and protected-resource metadata, dynamic registration, PKCE code flow, refresh and revocation endpoints. Clients should register the HTTPS `/mcp` URL without a literal Authorization header and follow the OAuth connect card.
+
+The owner consent page is served only by this MCP's HTTPS origin. It shows the requesting client and exact callback address, explains access, and requires the existing high-entropy owner connection key in a masked field. Enter that key only on the verified first-party page; never give it to an assistant chat. It remains the maintenance bearer credential as well. The assistant client receives separately issued expiring OAuth credentials and never needs the owner key. No per-message approvals are added by OAuth.
+
+OAuth state is persisted in private `/data/oauth.sqlite`. Authorization codes expire after two minutes and can be exchanged only once; the SDK verifies registered redirects, client authentication and PKCE. Access tokens expire after one hour. Refresh tokens rotate, expire after 30 days, and replay revokes their whole grant family. Access/code/refresh values are stored only as digests; the SDK's dynamic client registration metadata, including any issued confidential-client secret, stays in the private database. The current recipient policy remains enforced independently of OAuth.
+
+The HTTPS tunnel must pass the SDK discovery, registration, authorization, token, revocation and owner-consent paths to the authenticated MCP application. The application rejects unrelated paths and never proxies them to the WhatsApp bridge. All responses are marked no-store and HSTS. To revoke a client, use its authenticated OAuth revocation flow; owner-key rotation is a separate maintenance operation and does not by itself revoke previously approved client grants.

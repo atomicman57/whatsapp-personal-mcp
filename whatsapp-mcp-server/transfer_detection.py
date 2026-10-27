@@ -1,20 +1,38 @@
 """Deterministic intake clues, never beneficiary validation or payment authority."""
 import hashlib
 import re
+from datetime import datetime,timedelta
 from decimal import Decimal, InvalidOperation
 
-ACCOUNT = re.compile(r'(?<!\d)\d{10}(?!\d)')
-SECURITY = re.compile(r'\b(?:otp|one[- ]time(?: password| code)?|verification code|login code|password|passcode|secret pin|do not share|authentication code)\b',re.I)
+ACCOUNT = re.compile(r'(?<!\d)(?:\d{10}|\d{3}[ -]\d{3}[ -]\d{4}|\d{4}[ -]\d{3}[ -]\d{3}|\d{5}[ -]\d{5})(?!\d)')
+SECURITY = re.compile(r'\b(?:otp|one[- ]time(?: password| code)?|verification code|login code|access code|gate code|door code|password|passcode|secret pin|do not share|authentication code)\b',re.I)
 SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test bank|transfer_detector_test)\b',re.I)
 RECEIPT = re.compile(r'\b(?:send (?:me )?(?:the )?receipt|proof of payment|payment (?:successful|received|completed)|transfer (?:successful|completed)|transaction reference|money (?:received|has arrived)|already paid)\b',re.I)
 ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|assist|help me|i need|we need|balance|settle|deposit|owe)\b',re.I)
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
-BANK = re.compile(r'\b(?:bank|acct|account number|uba|gtbank|gtb|zenith|moniepoint|opay|palmpay|kuda|wema|alat|fcmb|fidelity|access bank|first bank|stanbic)\b',re.I)
-AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|thousand|million|naira)\b',re.I)
+BANK = re.compile(r'\b(?:bank|acct|account number|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
+AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million|naira)\b',re.I)
 BARE_AMOUNT = re.compile(r'\b(?:send|transfer|pay|need|borrow|lend|owe|balance|total)\s+(?:me\s+)?(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
 FX_AMOUNT = re.compile(r'(USD|EUR|GBP|\$|€|£)\s*(\d[\d,]*(?:\.\d{1,2})?)',re.I)
 IMPLICIT = re.compile(r'\b(?:gas|fuel|rent|school fees|electricity bill)\b.{0,50}\b(?:finish(?:ed)?|due|expired|renew)\b',re.I)
 TEST_PREFIX = 'TRANSFER_DETECTOR_TEST:'
+PURPOSE = re.compile(r'^(?:for\b|waybill\b|drinks\b|delivery\b|transport\b|gas\b|fuel\b|rent\b|school fees\b|electrician\b|plumbing\b|workmanship\b)',re.I)
+TOTAL = re.compile(r'\b(?:total|balance|amount)\s*[:=\-]*\s*(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
+
+def account_clues(text):
+    return list(dict.fromkeys(re.sub(r'\D','',x) for x in ACCOUNT.findall(text)))[:10]
+
+def recent_context(source,context):
+    """Only preceding same-chat evidence in a short request conversation window."""
+    result=[]
+    for row in context:
+        if row.get('id')==source.get('id') or row.get('chat_jid')!=source.get('chat_jid'):continue
+        try:
+            age=datetime.fromisoformat(source['timestamp'].replace('Z','+00:00'))-datetime.fromisoformat(row['timestamp'].replace('Z','+00:00'))
+            if not timedelta(0)<=age<=timedelta(hours=2):continue
+        except (ValueError,TypeError,KeyError):continue
+        if not sensitive(row.get('content','')) and not SYNTHETIC.search(row.get('content','')):result.append(row)
+    return result
 
 def amount_clues(text):
     result=[]
@@ -53,31 +71,56 @@ def classify(source,context=(),dry_run=False):
     if text.startswith(TEST_PREFIX):
         if not dry_run:return None
         text=text[len(TEST_PREFIX):]
-    context=[x for x in context if not sensitive(x.get('content','')) and not SYNTHETIC.search(x.get('content',''))]
+    context=recent_context(source,context)
     prior=[]
     for row in reversed(context):
         if row.get('id')==source.get('id'):continue
         body=row.get('content') or ''
         if RECEIPT.search(body):break
         prior.append(row)
-    previous=next((x for x in prior if request_language(x.get('content',''))),None)
-    accounts=list(dict.fromkeys(ACCOUNT.findall(text)))[:10]
+    previous=next((x for x in prior if request_language(x.get('content','')) or
+                   (account_clues(x.get('content','')) and BANK.search(x.get('content','')))),None)
+    if not previous:
+        # Reconstruct an account/bank pair split across adjacent messages so
+        # later amount/purpose updates retain the same request identity.
+        previous=next((x for i,x in enumerate(prior) if account_clues(x.get('content','')) and
+                       (BANK.search(text) or any(BANK.search(y.get('content','')) for y in prior[max(0,i-2):i+3]))),None)
+    accounts=account_clues(text)
+    account_source=source.get('id')
+    # A bank/name often follows the account number as a separate message.
+    if not accounts and BANK.search(text) and len(text)<300:
+        nearby=next((x for x in prior[:3] if account_clues(x.get('content',''))),None)
+        if nearby:
+            accounts=account_clues(nearby.get('content',''));account_source=nearby['id']
     amounts=amount_clues(text)
+    if accounts and BANK.search(text):
+        # Account/name/"1900" and itemized "total-48,500" are actual intake formats.
+        for match in list(TOTAL.finditer(text))+list(re.finditer(r'(?<![\d,])(\d[\d,]*(?:\.\d{1,2})?)\s*$',text)):
+            value=match.group(1).replace(',','')
+            if re.match(r'\s*(?:k|m|thousand|million|naira)\b',text[match.end(1):],re.I):continue
+            if len(value.split('.')[0])==10 or any(match.start(1)>=a.start() and match.end(1)<=a.end() for a in ACCOUNT.finditer(text)):continue
+            if 0<Decimal(value)<=Decimal('1000000000000') and not any(x['amount']==format(Decimal(value),'f') for x in amounts):
+                amounts.append({'text':match.group(0).strip()[:100],'amount':format(Decimal(value),'f'),'currency_hint':None,'currency_explicit':False})
     if previous and not amounts and re.fullmatch(r'\s*\d[\d,]*(?:\.\d{1,2})?\s*',text):
         value=text.strip().replace(',','')
         if len(value)<=20 and len(value.split('.')[0])!=10 and 0<Decimal(value)<=Decimal('1000000000000'):
             amounts=[{'text':text.strip(),'amount':format(Decimal(value),'f'),'currency_hint':None,'currency_explicit':False}]
     direct=request_language(text)
     reasons=[]
-    if accounts and (BANK.search(text) or previous):reasons.append('payment_details_with_context')
+    if accounts and (BANK.search(text) or previous or any(BANK.search(x.get('content','')) for x in prior[:3])):reasons.append('payment_details_with_context')
     if direct:reasons.append('request_language_with_money_or_amount')
     if IMPLICIT.search(text):reasons.append('possible_bill_or_supply_request')
     if amounts and previous:reasons.append('amount_follow_up')
+    purpose_follow_up=bool(previous and PURPOSE.search(text.strip()) and len(text)<400)
+    if purpose_follow_up:reasons.append('purpose_follow_up')
     if source.get('media_type') in ('image','document') and previous:reasons.append('attachment_in_request_context')
     if not reasons:return None
     anchor=source.get('id') if direct or not previous else previous['id']
+    for amount in amounts:amount['source_message_id']=source.get('id')
     return {'classification':'heuristic_candidate','reasons':reasons,'account_number_candidates':accounts,
+            'account_source_message_id':account_source if accounts else None,
             'amount_candidates':amounts,'anchor_message_id':anchor,'beneficiary_verified':False,
+            'amount_ambiguous':len({(x['amount'],x['currency_hint']) for x in amounts})>1,
             'amount_missing':not amounts and not any(amount_clues(x.get('content','')) for x in prior),
             'attachment_extraction_needed':source.get('media_type') in ('image','document')}
 

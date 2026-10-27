@@ -18,6 +18,12 @@ WHATSAPP_API_BASE_URL = os.environ.get(
 ).rstrip("/")
 BRIDGE_REQUEST_TIMEOUT_SECONDS = 30
 MEDIA_REQUEST_TIMEOUT_SECONDS = 120
+
+
+def bridge_headers() -> Dict[str, str]:
+    token = os.environ.get("WHATSAPP_BRIDGE_TOKEN", "")
+    return {"Authorization": "Bearer " + token} if token else {}
+
 MAX_PAGE_SIZE = 100
 MAX_PAGE_NUMBER = 1_000
 MAX_CONTEXT_MESSAGES = 50
@@ -96,7 +102,7 @@ def get_bridge_status() -> dict:
             result["database_error"] = str(error)
 
     try:
-        response = requests.get(f"{WHATSAPP_API_BASE_URL}/health", timeout=2)
+        response = requests.get(f"{WHATSAPP_API_BASE_URL}/health", timeout=2, headers=bridge_headers())
         response.raise_for_status()
         health = response.json()
         result.update(health)
@@ -128,6 +134,7 @@ def _bridge_api_request(
         response = requests.request(
             method,
             f"{WHATSAPP_API_BASE_URL}/{path.lstrip('/')}",
+            headers=bridge_headers(),
             json=payload,
             params=params,
             timeout=timeout,

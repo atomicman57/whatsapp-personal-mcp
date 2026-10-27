@@ -10,7 +10,6 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-import outbound_confirmation
 import main
 import macos_contacts
 import whatsapp
@@ -43,58 +42,25 @@ class RecordingConnection:
         pass
 
 
-class OutboundConfirmationTests(unittest.TestCase):
-    def setUp(self):
-        outbound_confirmation._pending.clear()
+class OutboundAccessTests(unittest.TestCase):
+    def test_sending_disabled_by_default_without_confirmation_prompt(self):
+        with mock.patch.dict("os.environ", {"WHATSAPP_SEND_ENABLED": "false"}):
+            result = main.send_message("15550000001", "Synthetic test", "request-test-0001")
+        self.assertEqual(result["code"], "sending_disabled")
+        self.assertNotIn("requires_confirmation", result)
 
-    def test_confirmation_is_exact_and_one_time(self):
-        draft = outbound_confirmation.prepare("text", "27820000000", "Hello")
-        token = draft["confirmation_token"]
-
-        confirmed, _ = outbound_confirmation.consume(
-            token, "text", "27820000000", "Changed"
-        )
-        self.assertFalse(confirmed)
-
-        draft = outbound_confirmation.prepare("text", "27820000000", "Hello")
-        token = draft["confirmation_token"]
-        confirmed, _ = outbound_confirmation.consume(
-            token, "text", "27820000000", "Hello"
-        )
-        self.assertTrue(confirmed)
-
-        confirmed_again, _ = outbound_confirmation.consume(
-            token, "text", "27820000000", "Hello"
-        )
-        self.assertFalse(confirmed_again)
-
-    def test_first_send_tool_call_only_prepares(self):
-        with mock.patch.object(
-            main, "whatsapp_send_message", side_effect=AssertionError("must not send")
-        ):
-            result = main.send_message("27820000000", "Preview only")
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["requires_confirmation"])
-        self.assertEqual(result["preview"], "Preview only")
-
-    def test_group_and_chat_mutations_only_prepare_on_first_call(self):
-        with mock.patch.object(
-            main, "whatsapp_create_group", side_effect=AssertionError("must not create")
-        ), mock.patch.object(
-            main,
-            "whatsapp_set_chat_read_state",
-            side_effect=AssertionError("must not update"),
-        ):
-            group_result = main.create_group("Field Team", ["+27820000000"])
-            read_result = main.set_chat_read_state(
-                "27820000000@s.whatsapp.net", True
-            )
-
-        self.assertTrue(group_result["requires_confirmation"])
-        self.assertIn("Field Team", group_result["preview"])
-        self.assertTrue(read_result["requires_confirmation"])
-        self.assertIn('"read":true', read_result["preview"])
+    def test_group_and_chat_mutations_use_configured_access_without_prompts(self):
+        with mock.patch.dict("os.environ", {"WHATSAPP_MUTATIONS_ENABLED": "true"}), mock.patch.object(
+            main, "whatsapp_create_group", return_value={"success": True}
+        ) as create, mock.patch.object(
+            main, "whatsapp_set_chat_read_state", return_value={"success": True}
+        ) as read:
+            self.assertTrue(main.create_group("Synthetic group", ["15550000001"])["success"])
+            self.assertTrue(main.set_chat_read_state("15550000001@s.whatsapp.net", True)["success"])
+        create.assert_called_once()
+        read.assert_called_once()
+        with mock.patch.dict("os.environ", {"WHATSAPP_MUTATIONS_ENABLED": "false"}):
+            self.assertEqual(main.create_group("Synthetic group", ["15550000001"])["code"], "mutations_disabled")
 
     def test_requested_capability_tools_are_registered(self):
         expected = {

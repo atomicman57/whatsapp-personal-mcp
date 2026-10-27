@@ -60,9 +60,28 @@ func (s *MessageStore) storeQuote(id, chat, sender string, msg *waProto.Message)
 	if err != nil {
 		return err
 	}
-	contextInfo := msg.GetExtendedTextMessage().GetContextInfo()
-	_, err = s.db.Exec(`INSERT OR REPLACE INTO message_quotes (id,chat_jid,sender_jid,payload,reply_to_message_id,reply_to_sender_jid) VALUES (?,?,?,?,?,?)`, id, chat, sender, data, contextInfo.GetStanzaID(), contextInfo.GetParticipant())
+	contextInfo := messageContextInfo(msg)
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO message_quotes (id,chat_jid,sender_jid,payload,reply_to_message_id,reply_to_sender_jid,forwarded) VALUES (?,?,?,?,?,?,?)`, id, chat, sender, data, contextInfo.GetStanzaID(), contextInfo.GetParticipant(), contextInfo.GetIsForwarded())
 	return err
+}
+
+func messageContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	switch {
+	case msg.ExtendedTextMessage != nil:
+		return msg.ExtendedTextMessage.ContextInfo
+	case msg.ImageMessage != nil:
+		return msg.ImageMessage.ContextInfo
+	case msg.VideoMessage != nil:
+		return msg.VideoMessage.ContextInfo
+	case msg.DocumentMessage != nil:
+		return msg.DocumentMessage.ContextInfo
+	case msg.AudioMessage != nil:
+		return msg.AudioMessage.ContextInfo
+	case msg.StickerMessage != nil:
+		return msg.StickerMessage.ContextInfo
+	default:
+		return nil
+	}
 }
 
 type replyTarget struct {

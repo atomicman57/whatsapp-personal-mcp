@@ -185,6 +185,7 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS message_quotes (
 			id TEXT, chat_jid TEXT, sender_jid TEXT NOT NULL, payload BLOB NOT NULL,
 			reply_to_message_id TEXT NOT NULL DEFAULT '', reply_to_sender_jid TEXT NOT NULL DEFAULT '',
+			forwarded BOOLEAN,
 			PRIMARY KEY (id,chat_jid)
 		);
 
@@ -194,6 +195,11 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 			ON messages (timestamp DESC);
 		CREATE INDEX IF NOT EXISTS idx_chats_last_message_time
 			ON chats (last_message_time DESC);
+		CREATE TABLE IF NOT EXISTS receipt_events (
+			chat_jid TEXT NOT NULL, message_id TEXT NOT NULL, recipient_jid TEXT NOT NULL,
+			status TEXT NOT NULL, timestamp TEXT NOT NULL,
+			PRIMARY KEY(chat_jid, message_id, recipient_jid, status, timestamp)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -210,6 +216,7 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		`ALTER TABLE chats ADD COLUMN community_jid TEXT`,
 		`ALTER TABLE chats ADD COLUMN is_default_community_chat BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE message_quotes ADD COLUMN forwarded BOOLEAN`,
 	} {
 		if _, err := db.Exec(statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 			db.Close()
@@ -280,10 +287,17 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
+		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, map[bool]string{true: "sent", false: ""}[isFromMe],
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(
+			(SELECT status FROM receipt_events WHERE message_id=? AND chat_jid=? ORDER BY
+			CASE status WHEN 'played' THEN 4 WHEN 'read' THEN 3 WHEN 'delivered' THEN 2 WHEN 'sent' THEN 1 ELSE 0 END DESC LIMIT 1), ?))
+		ON CONFLICT(id,chat_jid) DO UPDATE SET
+		sender=excluded.sender,content=excluded.content,timestamp=excluded.timestamp,is_from_me=excluded.is_from_me,
+		media_type=excluded.media_type,filename=excluded.filename,url=excluded.url,media_key=excluded.media_key,
+		file_sha256=excluded.file_sha256,file_enc_sha256=excluded.file_enc_sha256,file_length=excluded.file_length,
+		status=CASE WHEN messages.status IN ('played','read','delivered') THEN messages.status ELSE excluded.status END`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID, map[bool]string{true: "sent", false: ""}[isFromMe],
 	)
 	store.ingestion.recordWrite(err)
 	return err
@@ -521,6 +535,8 @@ func newDocumentMessage(mediaPath, caption, mimeType string, upload whatsmeow.Up
 		FileLength:    &upload.FileLength,
 	}
 }
+
+var buildVersion = "personal-direct-dev"
 
 type HealthResponse struct {
 	Status                  string                 `json:"status"`
@@ -1179,6 +1195,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 	registerCapabilityHandlers(mux, client, messageStore)
 	registerEventStreamHandler(mux, eventBroker)
 	registerReplyHandlers(mux, client, messageStore, eventBroker)
+	registerContactWorkflow(mux, client, messageStore)
 
 	// Health is read-only and reports both live connectivity and local cache age.
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -1210,7 +1227,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 			InstanceID:              configuredBridgeInstanceID(),
 			Ingestion:               ingestion, ReadsMayBeStale: true,
 			Coverage:      "unverified: connection and offline-sync completion do not prove all phone history is cached",
-			DatabaseError: databaseError, BuildVersion: "ingestion-health-2026-10-05",
+			DatabaseError: databaseError, BuildVersion: buildVersion,
 		})
 	})
 
@@ -1340,7 +1357,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 
 	server := &http.Server{
 		Addr:              serverAddr,
-		Handler:           protectLoopbackAPI(mux, configuredMaxBridgeRequestBodyBytes()),
+		Handler:           protectLoopbackAPI(protectBridgeAccess(mux), configuredMaxBridgeRequestBodyBytes()),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
@@ -1552,6 +1569,7 @@ func main() {
 	storeDir := flag.String("store-dir", defaultStoreDir(), "directory for login state, messages, and downloaded media")
 	logLevel := flag.String("log-level", "INFO", "whatsmeow log level (DEBUG, INFO, WARN, ERROR)")
 	logMessages := flag.Bool("log-messages", false, "include private message content in console logs")
+	noPair := flag.Bool("no-pair", false, "serve disconnected health without starting pairing when no linked device exists")
 	flag.Parse()
 
 	// Set up logger
@@ -1682,20 +1700,25 @@ func main() {
 			}
 
 		case *events.Receipt:
-			status := "delivered"
+			status := ""
 			switch v.Type {
+			case types.ReceiptTypeDelivered:
+				status = "delivered"
 			case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
 				status = "read"
-			case types.ReceiptTypeRetry:
-				status = "failed"
+			case types.ReceiptTypePlayed:
+				status = "played"
 			case types.ReceiptTypeSender:
 				status = "sent"
 			}
+			if status == "" {
+				break
+			} // retry and unknown receipt types do not prove delivery or failure
 			for _, messageID := range v.MessageIDs {
-				if err := messageStore.SetMessageStatus(v.Chat.String(), messageID, status); err != nil {
-					logger.Warnf("Failed to store receipt status for %s: %v", messageID, err)
+				if err := messageStore.StoreReceipt(v.Chat.String(), messageID, v.Sender.String(), status, v.Timestamp); err != nil {
+					logger.Warnf("Failed to store receipt status")
 				} else {
-					eventBroker.publish(bridgeEvent{Type: "receipt", ChatJID: v.Chat.String(), Status: status, MessageIDs: []string{messageID}})
+					eventBroker.publish(bridgeEvent{Type: "receipt", ChatJID: v.Chat.String(), Sender: v.Sender.String(), Timestamp: v.Timestamp.UTC().Format(time.RFC3339Nano), Status: status, MessageIDs: []string{messageID}})
 				}
 			}
 
@@ -1718,7 +1741,9 @@ func main() {
 	}
 
 	// Connect to WhatsApp
-	if client.Store.ID == nil {
+	if client.Store.ID == nil && *noPair {
+		logger.Warnf("Pairing required; automatic service startup does not create a new linked device")
+	} else if client.Store.ID == nil {
 		// No ID stored, this is a new client and must be paired.
 		pairingCtx, cancelPairing := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancelPairing()

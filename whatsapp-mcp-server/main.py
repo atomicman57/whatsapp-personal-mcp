@@ -1,10 +1,10 @@
-import json
+import os
 from typing import List, Dict, Any, Callable, Optional
 from mcp.server.fastmcp import FastMCP
 from macos_contacts import contacts_app_status as macos_contacts_app_status
-from outbound_confirmation import consume as consume_confirmation
-from outbound_confirmation import prepare as prepare_confirmation
+from direct_sending import send_message, send_file, send_audio_message
 from replies import reply_message
+from workflow_reads import export_chat, list_chat_state, get_message_status, get_contact_details, list_new_messages, download_profile_photo
 from transcription import transcribe_audio_file as whisper_transcribe_audio_file
 from transcription import whisper_status as get_whisper_status
 from whatsapp import (
@@ -29,9 +29,6 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
-    send_message as whatsapp_send_message,
-    send_file as whatsapp_send_file,
-    send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
 
@@ -39,6 +36,15 @@ from whatsapp import (
 mcp = FastMCP("whatsapp")
 
 mcp.tool()(reply_message)
+mcp.tool()(send_message)
+mcp.tool()(send_file)
+mcp.tool()(send_audio_message)
+mcp.tool()(export_chat)
+mcp.tool()(list_chat_state)
+mcp.tool()(get_message_status)
+mcp.tool()(get_contact_details)
+mcp.tool()(list_new_messages)
+mcp.tool()(download_profile_photo)
 
 MAX_PAGE_SIZE = 100
 MAX_PAGE_NUMBER = 1_000
@@ -53,22 +59,22 @@ def _clamp_integer(value: int, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(parsed, maximum))
 
 
-def _confirmed_mutation(
-    kind: str,
-    target: str,
-    payload: Dict[str, Any],
-    confirmation_token: Optional[str],
-    execute: Callable[[], Dict[str, Any]],
-) -> Dict[str, Any]:
-    preview = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    if not confirmation_token:
-        return prepare_confirmation(kind, target, preview)
-    confirmed, message = consume_confirmation(
-        confirmation_token, kind, target, preview
-    )
-    if not confirmed:
-        return {"success": False, "message": message}
+def _mutation(execute: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    if os.environ.get("WHATSAPP_MUTATIONS_ENABLED", "").lower() != "true":
+        return {"success": False, "code": "mutations_disabled"}
     return execute()
+
+
+@mcp.tool()
+def set_contact_name(phone_number: str, name: str) -> Dict[str, Any]:
+    """Create/rename a WhatsApp contact directly when mutation access is enabled.
+
+    Uses an exact international phone number. Sends a WhatsApp contact sync
+    patch; it does not create an iCloud/macOS address-book entry.
+    """
+    from whatsapp import _bridge_api_request
+    return _mutation(lambda: _bridge_api_request("POST", "contact/name", payload={
+        "phone_number": phone_number, "name": name}))
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -153,181 +159,68 @@ def is_on_whatsapp(phone_numbers: List[str]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def create_group(
-    name: str,
-    participants: List[str],
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, creation of a WhatsApp group.
-
-    The first call only returns a preview and token. Show the exact name and
-    participant list to the user before calling again with that token.
-    """
-    payload = {"name": name, "participants": participants}
-    return _confirmed_mutation(
-        "create_group",
-        name,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_create_group(name, participants),
-    )
+def create_group(name: str, participants: List[str]) -> Dict[str, Any]:
+    """Create a group directly when mutation access is enabled."""
+    return _mutation(lambda: whatsapp_create_group(name, participants))
 
 
-def _change_group_participants(
-    action: str,
-    group_jid: str,
-    participants: List[str],
-    confirmation_token: Optional[str],
-) -> Dict[str, Any]:
-    payload = {
-        "action": action,
-        "group_jid": group_jid,
-        "participants": participants,
-    }
-    return _confirmed_mutation(
-        f"group_participants_{action}",
-        group_jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_update_group_participants(group_jid, participants, action),
-    )
+def _change_group_participants(action: str, group_jid: str,
+                               participants: List[str]) -> Dict[str, Any]:
+    return _mutation(lambda: whatsapp_update_group_participants(group_jid, participants, action))
 
 
 @mcp.tool()
-def add_participants_to_group(
-    group_jid: str,
-    participants: List[str],
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, adding participants to a WhatsApp group."""
-    return _change_group_participants("add", group_jid, participants, confirmation_token)
+def add_participants_to_group(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Add group participants directly when mutation access is enabled."""
+    return _change_group_participants("add", group_jid, participants)
 
 
 @mcp.tool()
-def remove_participants_from_group(
-    group_jid: str,
-    participants: List[str],
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, removing participants from a WhatsApp group."""
-    return _change_group_participants("remove", group_jid, participants, confirmation_token)
+def remove_participants_from_group(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Remove group participants directly when mutation access is enabled."""
+    return _change_group_participants("remove", group_jid, participants)
 
 
 @mcp.tool()
-def promote_participants_to_admins(
-    group_jid: str,
-    participants: List[str],
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, promoting group participants to admins."""
-    return _change_group_participants("promote", group_jid, participants, confirmation_token)
+def promote_participants_to_admins(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Promote group participants directly when mutation access is enabled."""
+    return _change_group_participants("promote", group_jid, participants)
 
 
 @mcp.tool()
-def demote_participants_from_admins(
-    group_jid: str,
-    participants: List[str],
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, demoting WhatsApp group admins."""
-    return _change_group_participants("demote", group_jid, participants, confirmation_token)
+def demote_participants_from_admins(group_jid: str, participants: List[str]) -> Dict[str, Any]:
+    """Demote group admins directly when mutation access is enabled."""
+    return _change_group_participants("demote", group_jid, participants)
 
 
 @mcp.tool()
-def set_chat_read_state(
-    chat_jid: str,
-    read: bool,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, marking a WhatsApp chat read or unread."""
-    payload = {"chat_jid": chat_jid, "read": read}
-    return _confirmed_mutation(
-        "set_chat_read_state",
-        chat_jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_set_chat_read_state(chat_jid, read),
-    )
+def set_chat_read_state(chat_jid: str, read: bool) -> Dict[str, Any]:
+    """Mark a chat read/unread directly when mutation access is enabled."""
+    return _mutation(lambda: whatsapp_set_chat_read_state(chat_jid, read))
 
 
 @mcp.tool()
-def set_chat_mute(
-    chat_jid: str,
-    muted: bool,
-    duration_seconds: int = 0,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, muting or unmuting a WhatsApp chat.
-
-    A zero duration while muting means muted indefinitely.
-    """
-    payload = {
-        "chat_jid": chat_jid,
-        "muted": muted,
-        "duration_seconds": duration_seconds,
-    }
-    return _confirmed_mutation(
-        "set_chat_mute",
-        chat_jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_set_chat_mute(chat_jid, muted, duration_seconds),
-    )
+def set_chat_mute(chat_jid: str, muted: bool, duration_seconds: int = 0) -> Dict[str, Any]:
+    """Mute/unmute a chat directly; zero duration means indefinitely."""
+    return _mutation(lambda: whatsapp_set_chat_mute(chat_jid, muted, duration_seconds))
 
 
 @mcp.tool()
-def set_chat_archive(
-    chat_jid: str,
-    archived: bool,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, archiving or unarchiving a WhatsApp chat."""
-    payload = {"chat_jid": chat_jid, "archived": archived}
-    return _confirmed_mutation(
-        "set_chat_archive",
-        chat_jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_set_chat_archive(chat_jid, archived),
-    )
+def set_chat_archive(chat_jid: str, archived: bool) -> Dict[str, Any]:
+    """Archive/unarchive a chat directly when mutation access is enabled."""
+    return _mutation(lambda: whatsapp_set_chat_archive(chat_jid, archived))
 
 
 @mcp.tool()
-def set_contact_block(
-    jid: str,
-    blocked: bool,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, blocking or unblocking a WhatsApp contact."""
-    payload = {"jid": jid, "blocked": blocked}
-    return _confirmed_mutation(
-        "set_contact_block",
-        jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_set_contact_block(jid, blocked),
-    )
+def set_contact_block(jid: str, blocked: bool) -> Dict[str, Any]:
+    """Block/unblock a contact directly when mutation access is enabled."""
+    return _mutation(lambda: whatsapp_set_contact_block(jid, blocked))
 
 
 @mcp.tool()
-def send_typing_indicator(
-    chat_jid: str,
-    state: str,
-    media: str = "",
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, a composing or paused chat-presence update.
-
-    Use media='audio' only when indicating an audio recording state.
-    """
-    payload = {"chat_jid": chat_jid, "state": state, "media": media}
-    return _confirmed_mutation(
-        "send_typing_indicator",
-        chat_jid,
-        payload,
-        confirmation_token,
-        lambda: whatsapp_send_typing_indicator(chat_jid, state, media),
-    )
+def send_typing_indicator(chat_jid: str, state: str, media: str = "") -> Dict[str, Any]:
+    """Update composing/paused presence directly when mutation access is enabled."""
+    return _mutation(lambda: whatsapp_send_typing_indicator(chat_jid, state, media))
 
 @mcp.tool()
 def list_messages(
@@ -468,128 +361,6 @@ def get_message_context(
     return context
 
 @mcp.tool()
-def send_message(
-    recipient: str,
-    message: str,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, a WhatsApp text message.
-
-    The first call without confirmation_token only returns a preview and token; it
-    never sends. Show that preview to the user. Call this tool again with the exact
-    same recipient and message plus the token only after the user explicitly confirms.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-        confirmation_token: One-time token from the preview stage
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    if not message:
-        return {"success": False, "message": "Message must be provided"}
-
-    if not confirmation_token:
-        return prepare_confirmation("text", recipient, message)
-
-    confirmed, confirmation_message = consume_confirmation(
-        confirmation_token, "text", recipient, message
-    )
-    if not confirmed:
-        return {"success": False, "message": confirmation_message}
-
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "requires_confirmation": False,
-        "message": status_message,
-    }
-
-@mcp.tool()
-def send_file(
-    recipient: str,
-    media_path: str,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, a WhatsApp file send.
-
-    The first call only returns a preview and token. Show it to the user and call
-    again with the token only after explicit confirmation.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-        confirmation_token: One-time token from the preview stage
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    if not recipient or not media_path:
-        return {"success": False, "message": "Recipient and media path are required"}
-    if not confirmation_token:
-        return prepare_confirmation("file", recipient, media_path)
-
-    confirmed, confirmation_message = consume_confirmation(
-        confirmation_token, "file", recipient, media_path
-    )
-    if not confirmed:
-        return {"success": False, "message": confirmation_message}
-
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "requires_confirmation": False,
-        "message": status_message,
-    }
-
-@mcp.tool()
-def send_audio_message(
-    recipient: str,
-    media_path: str,
-    confirmation_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Prepare, then explicitly confirm, a WhatsApp voice-message send.
-
-    The first call only returns a preview and token. Show it to the user and call
-    again with the token only after explicit confirmation.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-        confirmation_token: One-time token from the preview stage
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    if not recipient or not media_path:
-        return {"success": False, "message": "Recipient and media path are required"}
-    if not confirmation_token:
-        return prepare_confirmation("audio", recipient, media_path)
-
-    confirmed, confirmation_message = consume_confirmation(
-        confirmation_token, "audio", recipient, media_path
-    )
-    if not confirmed:
-        return {"success": False, "message": confirmation_message}
-
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "requires_confirmation": False,
-        "message": status_message,
-    }
-
-@mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
     
@@ -646,5 +417,13 @@ def transcribe_audio_message(
     return result
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true")
+    parser.add_argument("--port", type=int, default=8744)
+    arguments = parser.parse_args()
+    if arguments.http:
+        from local_http import run_local_http
+        run_local_http(mcp, arguments.port)
+    else:
+        mcp.run(transport='stdio')

@@ -1,20 +1,27 @@
-import json
+import asyncio
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
-import outbound_confirmation
 import replies
 
-TARGET = {"chat_jid": "99900001@s.whatsapp.net", "message_id": "original",
-          "sender_jid": "99900002@lid", "text": "Birthday speech", "fingerprint": "hash"}
+TARGET = {"chat_jid": "15550000001@s.whatsapp.net", "message_id": "original",
+          "sender_jid": "99900002@lid", "text": "Synthetic message", "fingerprint": "hash"}
 
 class ReplyTests(unittest.TestCase):
     def setUp(self):
-        outbound_confirmation._pending.clear()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        env = patch.dict(os.environ, {"WHATSAPP_STORE_DIR": directory.name,
+            "WHATSAPP_SEND_ENABLED": "true", "WHATSAPP_SEND_ALLOWLIST": "",
+            "WHATSAPP_DO_NOT_CONTACT": ""})
+        env.start()
+        self.addCleanup(env.stop)
         self.calls = []
         self.target = dict(TARGET)
-        self.mock = patch.object(replies, "_bridge_api_request", side_effect=self.bridge)
-        self.mock.start()
-        self.addCleanup(self.mock.stop)
+        mock = patch.object(replies, "_bridge_api_request", side_effect=self.bridge)
+        mock.start()
+        self.addCleanup(mock.stop)
 
     def bridge(self, method, path, **kwargs):
         self.calls.append((method, path, kwargs))
@@ -22,57 +29,36 @@ class ReplyTests(unittest.TestCase):
             return {"success": True, "data": dict(self.target)}
         return {"success": True, "message_id": "sent-id", "reply_to_message_id": "original"}
 
-    def preview(self):
-        return replies.reply_message(TARGET["chat_jid"], "original", "Happy birthday!")
+    def send(self, message="Synthetic reply"):
+        return replies.reply_message(TARGET["chat_jid"], "original", message, "request-reply-0001")
 
-    def test_preview_then_confirm_exact_payload_and_replay(self):
-        p = self.preview()
-        self.assertTrue(p["requires_confirmation"])
-        self.assertEqual(p["quoted_message"]["sender_jid"], TARGET["sender_jid"])
-        self.assertEqual(json.loads(p["preview"])["message"], "Happy birthday!")
-        self.assertFalse(any(c[0] == "POST" for c in self.calls))
-        r = replies.reply_message(TARGET["chat_jid"], "original", "Happy birthday!", p["confirmation_token"])
-        self.assertTrue(r["success"])
-        self.assertEqual(self.calls[-1][2]["payload"], {"chat_jid": TARGET["chat_jid"], "message_id": "original", "message": "Happy birthday!", "fingerprint": "hash"})
-        r = replies.reply_message(TARGET["chat_jid"], "original", "Happy birthday!", p["confirmation_token"])
-        self.assertFalse(r["success"])
+    def test_direct_reply_preserves_quote_and_replay_never_sends_again(self):
+        self.assertTrue(self.send()["success"])
+        self.assertEqual(self.calls[-1][2]["payload"], {
+            "chat_jid": TARGET["chat_jid"], "message_id": "original",
+            "message": "Synthetic reply", "fingerprint": "hash"})
+        self.assertTrue(self.send()["replayed"])
         self.assertEqual(sum(c[0] == "POST" for c in self.calls), 1)
 
-    def test_target_changes_invalidate_confirmation(self):
-        for field in TARGET:
-            with self.subTest(field=field):
-                self.target = dict(TARGET)
-                p = self.preview()
-                self.target[field] = "changed"
-                r = replies.reply_message(TARGET["chat_jid"], "original", "Happy birthday!", p["confirmation_token"])
-                self.assertFalse(r["success"])
+    def test_changed_reply_with_same_id_is_rejected(self):
+        self.send()
+        self.assertEqual(self.send("Changed")["code"], "request_id_conflict")
+        self.assertEqual(sum(c[0] == "POST" for c in self.calls), 1)
+
+    def test_preview_failure_and_wrong_target_never_send(self):
+        self.target["chat_jid"] = "15550000002@s.whatsapp.net"
+        self.assertFalse(self.send()["success"])
         self.assertFalse(any(c[0] == "POST" for c in self.calls))
 
-    def test_changed_reply_rejected(self):
-        p = self.preview()
-        r = replies.reply_message(TARGET["chat_jid"], "original", "Different", p["confirmation_token"])
-        self.assertFalse(r["success"])
-        self.assertFalse(any(c[0] == "POST" for c in self.calls))
-
-    def test_preview_failure_does_not_send(self):
-        with patch.object(replies, "_bridge_api_request", return_value={"success": False, "message": "Not found"}) as api:
-            self.assertFalse(self.preview()["success"])
-            self.assertEqual(api.call_count, 1)
-        self.assertFalse(replies.reply_message("", "original", "text")["success"])
-
-    def test_mcp_tool_is_registered_with_confirmation_parameter(self):
-        import asyncio
+    def test_mcp_catalogue_has_request_ids_and_no_confirmation_tokens(self):
         import main
         tools = asyncio.run(main.mcp.list_tools())
-        tool = next(t for t in tools if t.name == "reply_message")
-        self.assertIn("confirmation_token", tool.inputSchema["properties"])
-        self.assertEqual(set(tool.inputSchema["required"]), {"chat_jid", "message_id", "message"})
+        for tool in tools:
+            self.assertNotIn("confirmation_token", tool.inputSchema.get("properties", {}))
+            if tool.name in {"send_message", "send_file", "send_audio_message", "reply_message"}:
+                self.assertIn("request_id", tool.inputSchema["required"])
 
-    def test_text_message_output_includes_quote_identifiers(self):
-        from datetime import datetime
-        import whatsapp
-        msg = whatsapp.Message(timestamp=datetime.now(), sender="self", content="text", is_from_me=True,
-                               chat_jid=TARGET["chat_jid"], id="original", chat_name="Self", media_type="")
-        output = whatsapp.format_message(msg)
-        self.assertIn("Message ID: original", output)
-        self.assertIn("Chat JID: " + TARGET["chat_jid"], output)
+    def test_disabled_reply_does_not_even_read_quote(self):
+        with patch.dict(os.environ, {"WHATSAPP_SEND_ENABLED": "false"}):
+            self.assertEqual(self.send()["code"], "sending_disabled")
+        self.assertEqual(self.calls, [])

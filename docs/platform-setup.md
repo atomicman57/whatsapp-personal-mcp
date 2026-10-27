@@ -21,10 +21,11 @@ On Windows, use `py scripts/run_bridge.py --instance-id personal`. The launcher 
 
 The bridge binds only to `127.0.0.1:8741`. Keep the bridge running before starting the MCP client.
 
-The HTTP API has no network authentication. Keep it on loopback, do not put it
-behind a reverse proxy or public tunnel, and do not expose it to a container or
-shared-host network namespace you do not trust. MCP confirmation tokens protect
-MCP workflows; they are not credentials for direct HTTP calls.
+All bridge HTTP routes require `WHATSAPP_BRIDGE_TOKEN`. Keep the API on loopback.
+Sending and other mutations use configured access, with no per-operation human
+approval. See the fork README for `scripts/personal_runtime.py`, persistent
+request IDs, recipient controls, and the encrypted-store deployment launcher.
+The upstream commands below require that authentication configuration as well.
 
 Every process should have a distinct instance ID. `/api/health` returns the ID
 from `WHATSAPP_BRIDGE_INSTANCE_ID`, and startup checks should require the

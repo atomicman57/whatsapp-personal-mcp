@@ -659,7 +659,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT DISTINCT
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -667,9 +667,15 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            LEFT JOIN messages m ON m.chat_jid = c.jid AND m.id = (
+                SELECT latest.id FROM messages latest WHERE latest.chat_jid = c.jid
+                ORDER BY latest.timestamp DESC, latest.id DESC LIMIT 1
+            )
+            WHERE c.jid = ? OR EXISTS (
+                SELECT 1 FROM messages matched
+                WHERE matched.chat_jid = c.jid AND matched.sender = ?
+            )
+            ORDER BY c.last_message_time DESC, c.jid
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
         

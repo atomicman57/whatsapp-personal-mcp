@@ -21,6 +21,7 @@ class StructuredReadProtocolTests(unittest.IsolatedAsyncioTestCase):
                 db.execute('CREATE TABLE messages(id TEXT,chat_jid TEXT,sender TEXT,content TEXT,timestamp TEXT,is_from_me INTEGER,media_type TEXT)')
                 db.execute('INSERT INTO chats VALUES(?,?,?)', (chat, 'Synthetic contact', stamp))
                 db.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)', ('synthetic-id', chat, '15555550001', 'Synthetic content', stamp, 1, ''))
+                db.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)', ('previous-id', chat, '15555550001', 'Previous content', '2026-10-27T09:59:00+00:00', 1, ''))
                 for lid in ['99900000000001@lid', '99900000000002@lid']:
                     db.execute('INSERT INTO chats VALUES(?,?,?)', (lid, 'Ambiguous profile', stamp))
             env = {**os.environ, 'WHATSAPP_STORE_DIR': directory, 'WHATSAPP_CONTACTS_HELPER': '/nonexistent/synthetic-helper', 'WHATSAPP_SEND_ENABLED': 'false'}
@@ -57,13 +58,17 @@ class StructuredReadProtocolTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await call('get_direct_chat_by_contact', {'sender_phone_number': '555550001'}))
                     self.assertIsNone(await call('get_direct_chat_by_contact', {'sender_phone_number': '99900000000001@lid'}))
                     matching = await call('get_contact_chats', {'jid': chat})
+                    self.assertEqual(len(matching), 1)
                     self.assertEqual(matching[0]['jid'], chat)
+                    self.assertEqual(matching[0]['last_message'], 'Synthetic content')
+                    by_sender = await call('get_contact_chats', {'jid': '15555550001'})
+                    self.assertEqual(len(by_sender), 1)
                     for context in [True, False]:
                         messages = await call('list_messages', {'chat_jid': chat, 'include_context': context})
-                        self.assertEqual(messages[0]['id'], 'synthetic-id')
-                        self.assertEqual(messages[0]['timestamp'], stamp)
+                        self.assertIn('synthetic-id', {message['id'] for message in messages})
+                        self.assertTrue(all(message['timestamp'].endswith('+00:00') for message in messages))
                     around = await call('get_message_context', {'message_id': 'synthetic-id'})
                     self.assertEqual(around['message']['id'], 'synthetic-id')
-                    self.assertEqual(around['before'], [])
+                    self.assertEqual(around['before'][0]['id'], 'previous-id')
                     self.assertIsNone(await call('get_chat', {'chat_jid': '15555559999@s.whatsapp.net'}))
                     self.assertIsNone(await call('get_direct_chat_by_contact', {'sender_phone_number': '15555559999'}))

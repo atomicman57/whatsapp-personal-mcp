@@ -1,7 +1,7 @@
 """Authenticated remote MCP behind a trusted HTTPS tunnel/reverse proxy."""
 import os
 import secrets
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import uvicorn
 from mcp.server.transport_security import TransportSecuritySettings
@@ -91,6 +91,18 @@ class HostedApp:
             if not message.get("more_body", False):
                 break
         delivered = False
+
+        # SDK 1.28's revocation model declares Optional[str] without a default,
+        # making the otherwise optional public-client secret a required field.
+        # Supply an empty value only when absent. The SDK still authenticates
+        # confidential clients against their actual registered secret.
+        if (self.oauth and scope.get("path") == "/revoke"
+                and scope.get("method") == "POST"
+                and values.get(b"content-type", [b""])[0].split(b";", 1)[0] == b"application/x-www-form-urlencoded"
+                and not any(key == "client_secret" for key, _ in parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))):
+            body.extend(b"&client_secret=")
+            scope = {**scope, "headers": [(key, value) for key, value in scope.get("headers", [])
+                                         if key.lower() != b"content-length"] + [(b"content-length", str(len(body)).encode())]}
 
         async def bounded_receive():
             nonlocal delivered

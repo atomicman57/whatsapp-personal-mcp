@@ -170,6 +170,10 @@ run_hosted_http(main.mcp, PORT)
         self.assertEqual((await self.http.post('/token', data=data)).status_code, 400)
         await self.refused(second['access_token'])
         third = await self.grant(client)
+        missing_secret = await self.http.post('/revoke', data={'client_id': client['client_id'],
+                                                              'token': third['refresh_token']})
+        self.assertEqual(missing_secret.status_code, 401)
+        await self.probe(third['access_token'])
         revoked = await self.http.post('/revoke', data={'client_id': client['client_id'],
             'client_secret': client['client_secret'], 'token': third['refresh_token']})
         self.assertEqual(revoked.status_code, 200)
@@ -203,6 +207,10 @@ run_hosted_http(main.mcp, PORT)
         self.assertEqual(sorted(response.status_code for response in responses), [200, 400])
         winner = next(response.json() for response in responses if response.status_code == 200)
         await self.probe(winner['access_token'])
+        revoked = await self.http.post('/revoke', data={'client_id': client['client_id'],
+                                                       'token': winner['refresh_token']})
+        self.assertEqual(revoked.status_code, 200)
+        await self.refused(winner['access_token'])
         _, expired, _ = await self.prepare(client)
         with sqlite3.connect(Path(self.directory.name) / 'oauth.sqlite') as db:
             db.execute('UPDATE grants SET expires=0 WHERE digest=?', (hashlib.sha256(expired['request_id'].encode()).hexdigest(),))

@@ -8,7 +8,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 
 class HostedApp:
-    def __init__(self, app, public_url, token, oauth=False):
+    def __init__(self, app, public_url, token, oauth=False, media=None):
         url = urlsplit(public_url)
         if (url.scheme != "https" or not url.hostname or url.username or url.password
                 or url.path not in ("", "/") or url.query or url.fragment
@@ -21,6 +21,7 @@ class HostedApp:
         self.authorization = ("Bearer " + token).encode("ascii")
         self.origin = public_url.rstrip("/")
         self.oauth = oauth
+        self.media = media
         self.oauth_paths = {
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-protected-resource/mcp",
@@ -67,6 +68,11 @@ class HostedApp:
             await self.reject(send, 403)
             return
         auth = values.get(b"authorization", [])
+        if scope.get('path','').startswith('/media/') and self.media is not None:
+            # Each object capability authenticates before reading binary data.
+            # It grants one file only, never the MCP bearer or bridge credential.
+            await self.media(scope,receive,send)
+            return
         if not self.oauth and (len(auth) != 1 or not secrets.compare_digest(auth[0], self.authorization)):
             await self.reject(send, 401)
             return
@@ -122,6 +128,9 @@ def run_hosted_http(mcp, port):
     if oauth and mcp.settings.auth is None:
         raise ValueError("OAuth mode requires the SDK authorization provider")
     app = HostedApp(None, public_url, token, oauth=oauth)
+    if os.environ.get('WHATSAPP_STORE_DIR'):
+        from media_transfer import configured_media
+        app.media = configured_media()
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True, allowed_hosts=sorted(app.hosts), allowed_origins=[])
     # Configure before constructing the SDK's lazily cached session manager.

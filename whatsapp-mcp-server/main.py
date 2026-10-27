@@ -8,6 +8,7 @@ from direct_sending import send_message, send_file, send_audio_message
 from replies import reply_message
 from workflow_reads import export_chat, list_chat_state, get_message_status, get_contact_details, list_new_messages, download_profile_photo
 from transfer_detector_status import get_transfer_detection_status
+from media_transfer import create_media_upload,get_media_download
 from transcription import transcribe_audio_file as whisper_transcribe_audio_file
 from transcription import whisper_status as get_whisper_status
 from whatsapp import (
@@ -56,6 +57,8 @@ mcp.tool()(list_chat_state)
 mcp.tool()(get_message_status)
 mcp.tool()(get_contact_details)
 mcp.tool()(get_transfer_detection_status)
+mcp.tool()(create_media_upload)
+mcp.tool()(get_media_download)
 mcp.tool()(list_new_messages)
 mcp.tool()(download_profile_photo)
 
@@ -391,7 +394,10 @@ def get_message_context(
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
+    """Download WhatsApp media to its bridge server and get file_path.
+
+    On hosted clients, call get_media_download(file_path) and retrieve its bytes
+    with the returned short-lived URL/headers. The path is not on your computer.
     
     Args:
         message_id: The ID of the message containing the media

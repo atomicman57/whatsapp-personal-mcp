@@ -22,14 +22,25 @@ def parsed_time(value):
     if result.tzinfo is None:raise ValueError('timezone required')
     return result
 
-def bounded_notification(payload,max_bytes=8192):
+def bounded_notification(payload,max_bytes=3500):
     payload=json.loads(json.dumps(payload))
+    # Some wake adapters truncate larger inputs. Keep control fields first,
+    # fit a complete JSON document, and give the receiver an end marker.
+    payload={'schema_version':1,'event_id':payload['event_id'],
+             'event_type':payload.get('event_type'),'dry_run':bool(payload.get('dry_run',False)),
+             'payment_authorized':False,**payload}
+    payload['payment_authorized']=False
+    payload['payload_end']=payload['event_id']
     def size():return len(json.dumps(payload,ensure_ascii=False,separators=(',',':')).encode())
     while size()>max_bytes and payload.get('context'):
         payload['context'].pop(0);payload['context_truncated']=True
     if size()>max_bytes and payload.get('source',{}).get('content'):
         payload['source']['content']=payload['source']['content'][:512];payload['context_truncated']=True
+    if size()>max_bytes and payload.get('candidate'):
+        payload['candidate']={'classification':'heuristic_candidate','details_omitted':True}
+        payload['candidate_truncated']=True;payload['context_may_be_incomplete']=True
     if size()>max_bytes:raise ValueError('notification_too_large')
+    payload['payload_end']=payload.pop('payload_end')
     return payload
 
 class State:

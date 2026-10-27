@@ -253,6 +253,18 @@ class WebhookTests(unittest.TestCase):
             self.assertEqual(post.call_args.kwargs['headers']['Idempotency-Key'],'stable-id')
         with patch('transfer_detector.requests.post',side_effect=requests.ConnectionError('sensitive URL here')):
             self.assertEqual(hook.send('stable-id',{}),(False,'webhook_network_error'))
+    def test_compact_envelope_keeps_controls_first_and_complete_end_marker(self):
+        payload={'event_id':'stable-id','event_type':'transfer_request_candidate','dry_run':True,
+                 'source':{'id':'source-id','content':'界'*2000},
+                 'candidate':{'amount_candidates':[{'text':'界'*100,'source_message_id':'id'*100} for _ in range(10)]},
+                 'context':[{'content':'界'*1600} for _ in range(12)]}
+        result=bounded_notification(payload)
+        body=json.dumps(result,ensure_ascii=False,separators=(',',':')).encode()
+        self.assertLessEqual(len(body),3500)
+        self.assertEqual(list(result)[:5],['schema_version','event_id','event_type','dry_run','payment_authorized'])
+        self.assertTrue(result['dry_run']);self.assertFalse(result['payment_authorized'])
+        self.assertEqual(result['payload_end'],result['event_id'])
+        self.assertTrue(result['context_truncated']);self.assertTrue(result['candidate_truncated'])
 
 class MCPStatusTests(unittest.TestCase):
     def test_absent_detector_does_not_start_or_contact_any_service(self):

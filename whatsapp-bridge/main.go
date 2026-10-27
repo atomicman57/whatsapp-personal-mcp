@@ -619,9 +619,9 @@ func protectLoopbackAPI(next http.Handler, maxBodyBytes int64) http.Handler {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string, *waProto.Message) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp", ""
+		return false, "Not connected to WhatsApp", "", nil
 	}
 
 	// Create JID for recipient
@@ -635,7 +635,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
+			return false, fmt.Sprintf("Error parsing JID: %v", err), "", nil
 		}
 	} else {
 		// Create JID from phone number
@@ -652,7 +652,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err), ""
+			return false, fmt.Sprintf("Error reading media file: %v", err), "", nil
 		}
 
 		mediaType, mimeType := mediaTypeAndMIME(mediaPath)
@@ -660,7 +660,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err), ""
+			return false, fmt.Sprintf("Error uploading media: %v", err), "", nil
 		}
 
 		// Create the appropriate message type based on media type
@@ -688,7 +688,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), "", nil
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -728,10 +728,24 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	response, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err), ""
+		return false, fmt.Sprintf("Error sending message: %v", err), "", nil
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient), response.ID
+	return true, fmt.Sprintf("Message sent to %s", recipient), response.ID, msg
+}
+
+// Preserve the actual accepted payload so outgoing attachments can be downloaded
+// and quoted later, even after the temporary outbox copy has been removed.
+func (store *MessageStore) storeOutboundMessage(id, chatJID, sender string, msg *waProto.Message, timestamp time.Time) error {
+	mediaType, filename, url, key, sha, encSHA, length := extractMediaInfo(msg)
+	if err := store.StoreMessage(id, chatJID, sender, extractTextContent(msg), timestamp, true,
+		mediaType, filename, url, key, sha, encSHA, length); err != nil {
+		return err
+	}
+	if sender != "" {
+		return store.storeQuote(id, chatJID, types.NewJID(sender, types.DefaultUserServer).String(), msg)
+	}
+	return nil
 }
 
 // Extract media info from a message
@@ -1260,7 +1274,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 		fmt.Println("Received outbound WhatsApp request")
 
 		// Send the message
-		success, message, messageID := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, messageID, sentPayload := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		if success && messageID != "" {
 			chatJID := req.Recipient
 			if parsed, parseErr := types.ParseJID(req.Recipient); parseErr == nil {
@@ -1272,10 +1286,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 			}
 			timestamp := time.Now()
 			_ = messageStore.StoreChat(chatJID, chatJID, timestamp)
-			if err := messageStore.StoreMessage(messageID, chatJID, sender, req.Message, timestamp, true, "", "", "", nil, nil, nil, 0); err == nil {
+			mediaType, filename, _, _, _, _, _ := extractMediaInfo(sentPayload)
+			if err := messageStore.storeOutboundMessage(messageID, chatJID, sender, sentPayload, timestamp); err == nil {
 				eventBroker.publish(bridgeEvent{
 					Type: "message", ID: messageID, ChatJID: chatJID, Sender: sender,
 					Content: req.Message, Timestamp: timestamp.Format(time.RFC3339), IsFromMe: true,
+					MediaType: mediaType, Filename: filename,
 				})
 			}
 		}

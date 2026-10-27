@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,26 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestOutgoingAttachmentRetainsDownloadAndQuotePayload(t *testing.T) {
+	s, c, chat := replyFixture(t)
+	msg := &waProto.Message{DocumentMessage: &waProto.DocumentMessage{
+		Caption: proto.String("Attachment caption"), FileName: proto.String("test.pdf"),
+		Mimetype: proto.String("application/pdf"), URL: proto.String("https://mmg.whatsapp.net/test.enc"),
+		MediaKey: []byte{1, 2}, FileSHA256: []byte{3, 4}, FileEncSHA256: []byte{5, 6}, FileLength: proto.Uint64(7),
+	}}
+	if err := s.storeOutboundMessage("sent-document", chat, c.Store.ID.User, msg, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	kind, filename, url, key, sha, encSHA, length, err := s.GetMediaInfo("sent-document", chat)
+	if err != nil || kind != "document" || filename != "test.pdf" || url != msg.DocumentMessage.GetURL() ||
+		!bytes.Equal(key, []byte{1, 2}) || !bytes.Equal(sha, []byte{3, 4}) || !bytes.Equal(encSHA, []byte{5, 6}) || length != 7 {
+		t.Fatalf("outgoing download metadata was not preserved: kind=%s, filename=%s, length=%d, err=%v", kind, filename, length, err)
+	}
+	if _, err = s.resolveReply(context.Background(), c, chat, "sent-document"); err != nil {
+		t.Fatalf("outgoing attachment cannot be quoted: %v", err)
+	}
+}
 
 func replyFixture(t *testing.T) (*MessageStore, *whatsmeow.Client, string) {
 	t.Helper()

@@ -118,15 +118,28 @@ def classify(source,context=(),dry_run=False):
     if not reasons:return None
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []
+    if previous and previous_accounts and not request_language(previous.get('content','')) and not direct:
+        # A split account/bank pair can itself follow the original request.
+        # Walk back only until a different destination or the request anchor.
+        for older in prior[prior.index(previous)+1:]:
+            older_accounts=account_clues(older.get('content',''))
+            if older_accounts and set(older_accounts)!=set(previous_accounts):break
+            if request_language(older.get('content','')):
+                anchor=older['id'];break
     different_destination=bool(accounts and previous_accounts and set(accounts)!=set(previous_accounts))
     if different_destination:anchor=account_source
+    linked_prior=[]
+    if anchor!=source.get('id'):
+        for row in prior:
+            linked_prior.append(row)
+            if row['id']==anchor:break
     for amount in amounts:amount['source_message_id']=source.get('id')
     return {'classification':'heuristic_candidate','reasons':reasons,'account_number_candidates':accounts,
             'account_source_message_id':account_source if accounts else None,
             'amount_candidates':amounts,'anchor_message_id':anchor,'beneficiary_verified':False,
             'amount_ambiguous':len({(x['amount'],x['currency_hint']) for x in amounts})>1,
             'different_destination_from_previous':different_destination,
-            'amount_missing':not amounts and (different_destination or not any(amount_clues(x.get('content','')) for x in prior)),
+            'amount_missing':not amounts and not any(amount_clues(x.get('content','')) for x in linked_prior),
             'attachment_extraction_needed':source.get('media_type') in ('image','document')}
 
 def digest(*values):

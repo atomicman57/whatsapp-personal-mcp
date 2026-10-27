@@ -78,6 +78,14 @@ class ClassifierTests(unittest.TestCase):
         for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
             result=classify(source,context)
             self.assertEqual(result['anchor_message_id'],account['id'])
+            if source!=amount:self.assertTrue(result['amount_missing'])
+    def test_five_part_conversation_retains_original_request_anchor(self):
+        rows=[message(1,'Please send money for plumbing repairs'),message(2,'012 345 6789'),
+              message(3,'Sterling Demo Beneficiary'),message(4,'1900'),message(5,'waybill')]
+        for i,row in enumerate(rows):
+            result=classify(row,rows[:i+1])
+            self.assertIsNotNone(result)
+            self.assertEqual(result['anchor_message_id'],rows[0]['id'])
     def test_account_leading_zero_amount_units_and_unknown_currency(self):
         result=classify(message())
         self.assertEqual(result['account_number_candidates'],['0123456789'])

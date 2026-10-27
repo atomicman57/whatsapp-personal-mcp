@@ -159,13 +159,14 @@ class OwnerOAuthProvider:
         params = AuthorizationParams.model_validate_json(row['data'])
         nonce = secrets.token_urlsafe(18)
         body = '''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect Second WhatsApp</title><style nonce="NONCE">body{font:16px system-ui;max-width:650px;margin:10vh auto;padding:24px;line-height:1.5}input,button{font:inherit;padding:12px;box-sizing:border-box;width:100%;margin:8px 0}code{overflow-wrap:anywhere}button{cursor:pointer}</style>
-<h1>Connect Second WhatsApp</h1><p>Client: <strong>CLIENT</strong></p><p>Return address: <code>CALLBACK</code></p>
+<title>Connect ACCOUNT_LABEL</title><style nonce="NONCE">body{font:16px system-ui;max-width:650px;margin:10vh auto;padding:24px;line-height:1.5}input,button{font:inherit;padding:12px;box-sizing:border-box;width:100%;margin:8px 0}code{overflow-wrap:anywhere}button{cursor:pointer}</style>
+<h1>Connect ACCOUNT_LABEL</h1><p>Client: <strong>CLIENT</strong></p><p>Return address: <code>CALLBACK</code></p>
 <p>This connector can read contacts, messages and media, and send under the server's configured recipient policy. Sends have no per-message approval prompts.</p>
 <form method="post" action="/owner/authorize"><input type="hidden" name="request_id" value="REQUEST"><input type="hidden" name="csrf" value="CSRF">
 <label for="owner_key">Private owner connection key</label><input id="owner_key" type="password" name="owner_key" autocomplete="off" required>
 <p>The key is sent only to this server. Keep it out of assistant chats.</p><button name="authorize" value="yes">Authorize this connector</button></form></html>'''
-        replacements = {'NONCE': nonce, 'CLIENT': html.escape(client.client_name or 'MCP client'),
+        replacements = {'NONCE': nonce, 'ACCOUNT_LABEL': html.escape(os.environ.get('WHATSAPP_ACCOUNT_LABEL', 'Second WhatsApp')[:100]),
+                        'CLIENT': html.escape(client.client_name or 'MCP client'),
                         'CALLBACK': html.escape(str(params.redirect_uri)), 'REQUEST': html.escape(request_id),
                         'CSRF': self.csrf(request_id)}
         for key, value in replacements.items():

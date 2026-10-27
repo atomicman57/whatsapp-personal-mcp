@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,10 @@ from mcp.client.streamable_http import streamable_http_client
 ORIGIN = 'https://mcp.example.test'
 KEY = 'synthetic-private-owner-key-never-a-real-credential'
 CALLBACK = 'https://client.example.test/oauth/callback'
+
+
+def callback_url(response):
+    return html.unescape(re.search(r'<a href="([^"]+)"', response.text).group(1))
 
 
 class OAuthProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -96,8 +101,8 @@ run_hosted_http(main.mcp, PORT)
     async def grant(self, client):
         verifier, values, _ = await self.prepare(client)
         approved = await self.approve(values)
-        self.assertEqual(approved.status_code, 303, approved.text)
-        result = parse_qs(urlsplit(approved.headers['location']).query)
+        self.assertEqual(approved.status_code, 200)
+        result = parse_qs(urlsplit(callback_url(approved)).query)
         self.assertEqual(result['state'], ['synthetic-state'])
         token = await self.exchange(client, result['code'][0], verifier)
         self.assertEqual(token.status_code, 200, token.text)
@@ -135,9 +140,10 @@ run_hosted_http(main.mcp, PORT)
         self.assertEqual((await self.approve(values, origin='null')).status_code, 403)
         self.assertEqual((await self.approve({**values, 'csrf': 'wrong'})).status_code, 403)
         approved = await self.approve(values)
-        self.assertEqual(approved.status_code, 303)
+        self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.headers['referrer-policy'], 'no-referrer')
-        code = parse_qs(urlsplit(approved.headers['location']).query)['code'][0]
+        self.assertIn("form-action 'none'", approved.headers['content-security-policy'])
+        code = parse_qs(urlsplit(callback_url(approved)).query)['code'][0]
         self.assertEqual((await self.approve(values)).status_code, 410)
         self.assertEqual((await self.exchange(client, code, 'x' * 43)).status_code, 400)
         self.assertEqual((await self.exchange(client, code, verifier, redirect='https://attacker.test')).status_code, 400)
@@ -205,7 +211,7 @@ run_hosted_http(main.mcp, PORT)
         client = await self.register()
         verifier, values, _ = await self.prepare(client)
         approved = await self.approve(values)
-        code = parse_qs(urlsplit(approved.headers['location']).query)['code'][0]
+        code = parse_qs(urlsplit(callback_url(approved)).query)['code'][0]
         responses = await asyncio.gather(self.exchange(client, code, verifier), self.exchange(client, code, verifier))
         self.assertEqual(sorted(response.status_code for response in responses), [200, 400])
         winner = next(response.json() for response in responses if response.status_code == 200)

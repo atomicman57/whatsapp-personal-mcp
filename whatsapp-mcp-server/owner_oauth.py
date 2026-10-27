@@ -146,8 +146,17 @@ class OwnerOAuthProvider:
                 db.execute('UPDATE grants SET active=0 WHERE digest=?', (row['digest'],))
                 db.execute('UPDATE clients SET approved=1 WHERE id=?', (row['client'],))
                 self.put(db, 'code', code, row['client'], authorization.model_dump(mode='json', exclude={'code'}), expires)
-            return RedirectResponse(construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state),
-                                    status_code=303, headers={'Referrer-Policy': 'no-referrer'})
+            # Finish the form navigation on this origin. Chromium applies the
+            # form-action policy to an external redirect after a POST, including
+            # additional redirects owned by the client. A normal link on this
+            # separate page completes OAuth without forwarding the form/key.
+            callback = html.escape(construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state), quote=True)
+            return HTMLResponse('<!doctype html><html lang="en"><meta charset="utf-8">'
+                '<title>WhatsApp authorization approved</title><h1>Authorization approved</h1>'
+                '<p>Return to your app to finish connecting WhatsApp.</p>'
+                '<a href="' + callback + '" rel="noreferrer">Return to your app</a></html>',
+                headers={'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
+                         'Content-Security-Policy': "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'"})
         request_id = request.query_params.get('request', '')
         with self.db() as db:
             row = self.row(db, 'request', request_id)

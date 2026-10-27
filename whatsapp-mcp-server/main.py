@@ -419,10 +419,15 @@ def transcribe_audio_message(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--http", action="store_true")
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--http", action="store_true")
+    transport.add_argument("--hosted-http", action="store_true")
     parser.add_argument("--port", type=int, default=8744)
     arguments = parser.parse_args()
-    if arguments.http:
+    if arguments.hosted_http:
+        from hosted_http import run_hosted_http
+        run_hosted_http(mcp, arguments.port)
+    elif arguments.http:
         from local_http import run_local_http
         run_local_http(mcp, arguments.port)
     else:

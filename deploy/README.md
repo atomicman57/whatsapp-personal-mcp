@@ -1,0 +1,15 @@
+# Hosted second-account deployment
+
+Run the bridge and MCP together on an always-on Linux Docker host. The bridge remains on container loopback; publish only the authenticated MCP at host loopback. A dedicated Cloudflare Tunnel provides HTTPS without opening a server firewall port. This deployment does not depend on a laptop tunnel.
+
+The hosted HTTP mode requires `WHATSAPP_MCP_PUBLIC_URL` (a canonical HTTPS origin) and a distinct random `WHATSAPP_MCP_TOKEN` with at least 32 characters. Every MCP HTTP request, including session requests, requires `Authorization: Bearer <token>`. Configure this header in the MCP client's private server settings. This is preconfigured bearer authentication, not OAuth discovery or a per-message approval flow. Keep each client credential private and rotate it on loss. Do not put credentials in URLs or repository configuration.
+
+Set the bridge token separately using `WHATSAPP_BRIDGE_TOKEN`. In production, generate both via the owner's encrypted credential store, then send the minimum runtime secrets to root-owned `/etc/whatsapp-secondary/runtime.env` over verified SSH. The tunnel credential is a separate root-directory file mounted read-only for cloudflared. Service units and client examples must never contain literal tokens. Cloudflare API administration credentials are not installed on the server.
+
+Build `deploy/Dockerfile` from the repository root. Python dependencies are hash-locked in `requirements.lock`. `/data` must be a persistent private host directory owned by UID/GID 10150. Use the provided hardened service units and an `images.env` file containing `WHATSAPP_IMAGE` (the versioned local image) and `TUNNEL_IMAGE` (the official cloudflared image pinned by digest). Neither unit grants capabilities or publishes the bridge. Application access logs are disabled; do not enable message-body logging.
+
+Before moving a linked account, stop its local bridge and MCP services. Transfer its private store using verified encrypted SSH, including all SQLite state and the durable outbound journal. Never run two bridges with copies of the same login database. Preserve the local stopped copy for rollback; do not auto-start it after migrating. Start the hosted service, verify exact account identity and journal replay, then start its tunnel. Do not mark an unpaired/disconnected bridge healthy merely because the HTTP process is running.
+
+The send allowlist and do-not-contact list are server-side runtime configuration. Start with a self-only allowlist until account routing and the current exclusion list have been verified. Account mutations remain a separate capability. Persist all state under the host volume; a container's ephemeral root filesystem is not a database backup.
+
+Before enabling broader use, test unauthenticated/incorrect-token rejection, authenticated MCP initialization, exact own identity, a self-chat text/reply/attachment, duplicate replay across a service restart and server-to-WhatsApp connectivity while laptop services are stopped. Distinguish provider acceptance from delivery and read receipts.

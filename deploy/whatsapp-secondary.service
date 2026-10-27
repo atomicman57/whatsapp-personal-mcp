@@ -1,0 +1,19 @@
+[Unit]
+Description=Second WhatsApp authenticated MCP and bridge
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/whatsapp-secondary/images.env
+ExecStartPre=-/usr/bin/docker rm whatsapp-secondary
+ExecStart=/usr/bin/docker run --name whatsapp-secondary --init --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=128 --memory=768m --cpus=1 --publish=127.0.0.1:8754:8754 --env-file=/etc/whatsapp-secondary/runtime.env --mount=type=bind,src=/var/lib/whatsapp-secondary/data,dst=/data --tmpfs=/tmp:rw,noexec,nosuid,size=64m ${WHATSAPP_IMAGE}
+ExecStop=/usr/bin/docker stop --time=25 whatsapp-secondary
+Restart=always
+RestartSec=5
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

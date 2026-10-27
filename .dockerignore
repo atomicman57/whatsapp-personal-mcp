@@ -1,0 +1,11 @@
+**
+!deploy/
+!deploy/Dockerfile
+!deploy/requirements.lock
+!deploy/entrypoint.py
+!whatsapp-bridge/
+!whatsapp-bridge/*.go
+!whatsapp-bridge/go.mod
+!whatsapp-bridge/go.sum
+!whatsapp-mcp-server/
+!whatsapp-mcp-server/*.py

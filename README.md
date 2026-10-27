@@ -89,3 +89,7 @@ are separate from registration and tool discovery.
 ## Attribution and licence
 
 Based on [DJNgoma/whatsapp-mcp](https://github.com/DJNgoma/whatsapp-mcp), a maintained fork of [Luke Harries' original](https://github.com/lharries/whatsapp-mcp). The original MIT notice is preserved in LICENSE. Dependency licences still apply to linked binaries; review the whatsmeow/libsignal dependency licences before redistribution.
+
+## Always-on hosted use
+
+The separate `--hosted-http` transport requires a canonical HTTPS origin and a distinct bearer credential on every request. Deploy the bridge and MCP together on an always-on Linux host with persistent private storage, following [deploy/README.md](deploy/README.md). The local `--http` mode remains loopback-only and must not be exposed through a tunnel. Hosted mode is explicitly configured and authenticated; it does not add per-message approvals. Its account state and duplicate journal must move together, with the old bridge stopped before the hosted one starts.

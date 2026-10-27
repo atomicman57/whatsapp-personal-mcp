@@ -1,0 +1,19 @@
+[Unit]
+Description=Second WhatsApp outbound HTTPS tunnel
+Requires=docker.service whatsapp-secondary.service
+After=docker.service whatsapp-secondary.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/whatsapp-secondary/images.env
+ExecStartPre=-/usr/bin/docker rm whatsapp-secondary-tunnel
+ExecStart=/usr/bin/docker run --name whatsapp-secondary-tunnel --read-only --network=host --user=65532:65532 --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=128m --mount=type=bind,src=/etc/whatsapp-secondary/tunnel-token,dst=/run/tunnel-token,readonly ${TUNNEL_IMAGE} tunnel --no-autoupdate --loglevel=warn run --token-file=/run/tunnel-token
+ExecStop=/usr/bin/docker stop --time=15 whatsapp-secondary-tunnel
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

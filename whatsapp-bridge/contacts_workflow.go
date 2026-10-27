@@ -24,6 +24,7 @@ func contactNamePatch(jid types.JID, name string) appstate.PatchInfo {
 }
 
 func registerContactWorkflow(mux *http.ServeMux, client *whatsmeow.Client, store *MessageStore) {
+	registerDeviceContactSearch(mux, client)
 	mux.HandleFunc("/api/contact/details", func(w http.ResponseWriter, r *http.Request) {
 		if !requireMethod(w, r, http.MethodGet) {
 			return

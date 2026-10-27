@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 import os
 import requests
@@ -516,9 +517,11 @@ def _normalize_phone_number(phone_number: Optional[str]) -> str:
 
 
 def _search_whatsapp_contacts(query: str) -> List[Contact]:
-    """Search direct-chat contacts already known to the WhatsApp message cache."""
+    """Merge chat labels with the bridge's local device contact directory."""
+    result = []
+    known_jids = set()
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = sqlite3.connect(Path(MESSAGES_DB_PATH).resolve().as_uri()+"?mode=ro", uri=True)
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
@@ -538,7 +541,7 @@ def _search_whatsapp_contacts(query: str) -> List[Contact]:
         
         contacts = cursor.fetchall()
         
-        result = []
+        known_jids = {row[0] for row in cursor.execute("SELECT jid FROM chats")}
         for contact_data in contacts:
             contact = Contact(
                 # A numeric LID is an opaque WhatsApp identifier, not a phone.
@@ -551,14 +554,35 @@ def _search_whatsapp_contacts(query: str) -> List[Contact]:
             )
             result.append(contact)
             
-        return result
-        
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+    except sqlite3.Error:
+        pass
     finally:
         if 'conn' in locals():
             conn.close()
+
+    if not os.environ.get("WHATSAPP_BRIDGE_TOKEN"):
+        return result
+    response = _bridge_api_request("GET", "contacts/search", params={"query":query,"limit":50})
+    if not response.get("success") or not isinstance(response.get("data"), list):
+        return result
+    discovered = {}
+    claimed_aliases = set()
+    for item in response["data"]:
+        if not isinstance(item,dict) or not item.get("jid"):
+            continue
+        aliases = [x for x in item.get("aliases",[]) if isinstance(x,str)]
+        phone = next((x.removesuffix("@s.whatsapp.net") for x in aliases
+                      if x.endswith("@s.whatsapp.net") and x.removesuffix("@s.whatsapp.net").isdigit()),None)
+        # A device LID remains opaque unless the bridge supplied a verified PN alias.
+        chat_jid = next((x for x in aliases if x in known_jids),None)
+        contact = Contact(phone_number=phone,name=item.get("name"),jid=chat_jid or item["jid"],
+                          source="whatsapp_device_contacts",has_whatsapp_chat=bool(chat_jid))
+        key = phone or item["jid"]
+        score = 2 if item.get("saved_name") else 1 if item.get("business_name") else 0
+        if key not in discovered or score>discovered[key][0]:
+            discovered[key] = (score,contact)
+        claimed_aliases.update(aliases)
+    return [x for x in result if x.jid not in claimed_aliases]+[x[1] for x in discovered.values()]
 
 
 def search_contacts(query: str) -> List[Contact]:

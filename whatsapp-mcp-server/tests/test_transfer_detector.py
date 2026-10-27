@@ -65,6 +65,19 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result['anchor_message_id'],account['id'])
         self.assertIsNone(classify(message(3,'1900'),[account,bank]))
         self.assertIsNone(classify(message(4,TEST_PREFIX+' 1900'),[message(1,'Please send NGN 5000')],dry_run=True))
+    def test_new_vendor_does_not_inherit_prior_destination_or_amount(self):
+        old=message(1,'0123456789 Opay Vendor One 7k')
+        new=message(2,'0987654321 Moniepoint Vendor Two')
+        result=classify(new,[old,new])
+        self.assertEqual(result['anchor_message_id'],new['id'])
+        self.assertTrue(result['different_destination_from_previous'])
+        self.assertTrue(result['amount_missing'])
+        account=message(3,'0111122223')
+        bank=message(4,'Sterling Vendor Three')
+        amount=message(5,'1900')
+        for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
+            result=classify(source,context)
+            self.assertEqual(result['anchor_message_id'],account['id'])
     def test_account_leading_zero_amount_units_and_unknown_currency(self):
         result=classify(message())
         self.assertEqual(result['account_number_candidates'],['0123456789'])

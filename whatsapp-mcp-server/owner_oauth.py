@@ -146,7 +146,8 @@ class OwnerOAuthProvider:
                 db.execute('UPDATE grants SET active=0 WHERE digest=?', (row['digest'],))
                 db.execute('UPDATE clients SET approved=1 WHERE id=?', (row['client'],))
                 self.put(db, 'code', code, row['client'], authorization.model_dump(mode='json', exclude={'code'}), expires)
-            return RedirectResponse(construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state), status_code=303)
+            return RedirectResponse(construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state),
+                                    status_code=303, headers={'Referrer-Policy': 'no-referrer'})
         request_id = request.query_params.get('request', '')
         with self.db() as db:
             row = self.row(db, 'request', request_id)
@@ -170,7 +171,10 @@ class OwnerOAuthProvider:
         for key, value in replacements.items():
             body = body.replace(key, value)
         return HTMLResponse(body, headers={'Content-Security-Policy': "default-src 'none'; style-src 'nonce-" + nonce + "'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-            'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff'})
+            # HTML form navigation under no-referrer sends Origin:null. Keep
+            # same-origin POSTs compatible with the strict Origin/CSRF checks,
+            # while withholding the consent URL from cross-origin navigation.
+            'Referrer-Policy': 'same-origin', 'X-Content-Type-Options': 'nosniff'})
 
     async def load_authorization_code(self, client, authorization_code):
         with self.db() as db:

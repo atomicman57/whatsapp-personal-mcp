@@ -66,9 +66,19 @@ def parse_link_window(value):
     except (TypeError,ValueError):return LINK_WINDOW_SECONDS
     return min(seconds,MAX_LINK_WINDOW_SECONDS) if seconds>0 else LINK_WINDOW_SECONDS
 
+def phrase_pattern(phrase):
+    # Whole words only: "MARKET BREAKDOWN" never matches inside "SUPERMARKET BREAKDOWNS".
+    return re.compile(r'(?<!\w)'+r'\s+'.join(re.escape(x) for x in phrase.split())+r'(?!\w)',re.I)
+
 def excluded(row,body,exclusions):
-    folded=' '.join((body or '').split()).casefold()
-    return any(jid in ('*',row.get('chat_jid')) and phrase.casefold() in folded for jid,phrase in exclusions)
+    return any(jid in ('*',row.get('chat_jid')) and phrase_pattern(phrase).search(body or '') for jid,phrase in exclusions)
+
+def linkable(source,row):
+    """Outgoing messages never link; group chats link only one sender's own messages."""
+    if row.get('is_from_me'):return False
+    if not (source.get('chat_jid') or '').endswith('@g.us'):return True
+    # `sender` is the bridge message row's participant JID.
+    return bool(source.get('sender')) and row.get('sender')==source.get('sender')
 
 def account_clues(text):
     return list(dict.fromkeys(re.sub(r'\D','',x) for x in ACCOUNT.findall(text)))[:10]
@@ -143,7 +153,8 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     for row in ordered:
         if row.get('is_from_me') or row['id']==skip_id:continue
         elapsed=age(source,row)
-        if elapsed is None or elapsed>window:break
+        if elapsed is None:continue
+        if elapsed>window:break
         body=row.get('content') or ''
         row_accounts=account_clues(body)
         # Stop at another destination; its amount is not ours.
@@ -167,7 +178,8 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     ordered=[]
     for row in reversed(context):
         if RECEIPT.search(row.get('content') or ''):break
-        ordered.append(row)
+        # Outgoing rows and other group members are never either half of a link.
+        if linkable(source,row):ordered.append(row)
     def spent(i,row):
         # Account details answering an excluded spend report belong to it.
         body=row.get('content') or ''

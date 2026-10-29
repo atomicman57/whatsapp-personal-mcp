@@ -7,7 +7,7 @@ from unittest.mock import patch,Mock
 
 import requests
 from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
-    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES)
+    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount)
 from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
 from transfer_detector_status import get_transfer_detection_status
 
@@ -128,10 +128,11 @@ CHEF='205037695422603@lid'
 MARKET=('Day 7 Thursday MARKET BREAKDOWN\nTomatoes 10k\nPepper 5k\nChicken 26,000\nRice 22,500\nTOTAL==== 63,500')
 KITCHEN=('Kitchen replacements\nFrying pan 18,000\nPlates 10k\nKnife set 23,500\nTotal= 51,500')
 ACCOUNT_UBA='2267217814\nU.B.A'
+GROUP='120363000000000001@g.us';ALICE='15550000101@s.whatsapp.net';BOB='15550000102@s.whatsapp.net'
 
 def chef(sequence,text,minutes_ago=0,**extra):
-    return message(sequence,text,chat_jid=CHEF,id='synthetic-chef-'+str(sequence),
-                   timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat(),**extra)
+    return {**message(sequence,text,chat_jid=CHEF,id='synthetic-chef-'+str(sequence),
+                      timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat()),**extra}
 
 class SplitBillTests(unittest.TestCase):
     exclusions=DEFAULT_EXCLUDED_CHAT_PHRASES
@@ -224,6 +225,45 @@ class SplitBillTests(unittest.TestCase):
         # A different destination is never merged with an older bill.
         rows=[chef(1,KITCHEN,minutes_ago=3),chef(2,'0123456789 Opay Vendor One',minutes_ago=2),chef(3,ACCOUNT_UBA)]
         self.assertTrue(self.run_chat(rows)[2]['amount_missing'])
+    def test_outgoing_messages_are_never_either_half_of_a_link(self):
+        rows=[chef(1,ACCOUNT_UBA,minutes_ago=2,is_from_me=True),chef(2,'Total= 51,500')]
+        self.assertIsNone(classify(rows[1],rows,exclusions=self.exclusions))
+        rows=[chef(1,KITCHEN,minutes_ago=2,is_from_me=True),chef(2,'2267217814',minutes_ago=1),chef(3,'U.B.A')]
+        for result in [classify(rows[2],rows,exclusions=self.exclusions),classify(rows[1],rows[:2],exclusions=self.exclusions)]:
+            if result is None:continue
+            self.assertEqual(result['amount_candidates'],[])
+            self.assertNotIn('synthetic-chef-1',result['source_message_ids'])
+        # An outgoing account never becomes the adopted destination of a bank-only reply.
+        rows=[chef(1,ACCOUNT_UBA,minutes_ago=1,is_from_me=True),chef(2,'Sterling Demo Beneficiary')]
+        result=classify(rows[1],rows,exclusions=self.exclusions)
+        self.assertTrue(result is None or result['account_number_candidates']==[])
+    def test_group_split_links_require_same_sender(self):
+        def member(sequence,text,sender,minutes_ago=0):
+            return chef(sequence,text,minutes_ago,chat_jid=GROUP,sender=sender)
+        rows=[member(1,KITCHEN,ALICE,minutes_ago=2),member(2,ACCOUNT_UBA,BOB)]
+        result=classify(rows[1],rows,exclusions=self.exclusions)
+        self.assertTrue(result['amount_missing'])
+        self.assertEqual(result['source_message_ids'],['synthetic-chef-2'])
+        rows=[member(1,ACCOUNT_UBA,BOB,minutes_ago=2),member(2,'Total= 51,500',ALICE)]
+        self.assertIsNone(classify(rows[1],rows,exclusions=self.exclusions))
+        rows=[member(1,KITCHEN,ALICE,minutes_ago=2),member(2,ACCOUNT_UBA,ALICE)]
+        result=classify(rows[1],rows,exclusions=self.exclusions)
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['51500'])
+        self.assertEqual(result['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
+    def test_excluded_phrase_matches_whole_words_case_insensitively(self):
+        exclusions=(('*','MARKET BREAKDOWN'),)
+        row={'chat_jid':CHEF}
+        self.assertTrue(excluded(row,'Today market   breakdown:\nTotal= 5,000',exclusions))
+        self.assertTrue(excluded(row,'(Market Breakdown)',exclusions))
+        self.assertFalse(excluded(row,'SUPERMARKET BREAKDOWNEXTRA',exclusions))
+        self.assertFalse(excluded(row,'supermarket breakdown',exclusions))
+        self.assertFalse(excluded(row,'market breakdowns',exclusions))
+    def test_linked_amount_skips_rows_with_unreadable_timestamps(self):
+        source=chef(3,'2267217814')
+        ordered=[chef(2,'Total= 9,999',timestamp='not-a-time'),chef(1,KITCHEN,minutes_ago=2)]
+        found,from_excluded=linked_amount(source,ordered,['2267217814'],source['id'],timedelta(minutes=15),())
+        self.assertFalse(from_excluded)
+        self.assertEqual([(x['amount'],x['source_message_id']) for x in found],[('51500','synthetic-chef-1')])
     def test_exclusion_configuration(self):
         self.assertEqual(parse_excluded_chat_phrases(None),DEFAULT_EXCLUDED_CHAT_PHRASES)
         self.assertEqual(parse_excluded_chat_phrases('  '),DEFAULT_EXCLUDED_CHAT_PHRASES)

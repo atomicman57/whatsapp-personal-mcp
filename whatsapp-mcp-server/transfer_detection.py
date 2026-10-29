@@ -1,10 +1,13 @@
 """Deterministic intake clues, never beneficiary validation or payment authority."""
 import hashlib
 import re
+from functools import lru_cache
 from datetime import datetime,timedelta
 from decimal import Decimal, InvalidOperation
 
 ACCOUNT = re.compile(r'(?<!\d)(?:\d{10}|\d{3}[ -]\d{3}[ -]\d{4}|\d{4}[ -]\d{3}[ -]\d{3}|\d{5}[ -]\d{5})(?!\d)')
+# Nigerian mobile numbers ("+234 803 123 4567", "0 803-123-4567") are not NUBANs.
+PHONE = re.compile(r'(?:(?<![\w+])\(?\+?234\)?|(?<![\w,.])0)[ \t-]*[789]\d{2}[ -]?\d{3}[ -]?\d{4}(?!\d)')
 SECURITY = re.compile(r'\b(?:otp|one[- ]time(?: password| code)?|verification code|login code|access code|gate code|door code|password|passcode|secret pin|do not share|authentication code)\b',re.I)
 SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test bank|transfer_detector_test)\b',re.I)
 RECEIPT = re.compile(r'\b(?:send (?:me )?(?:the )?receipt|proof of payment|payment (?:successful|received|completed)|transfer (?:successful|completed)|transaction reference|money (?:received|has arrived)|already paid)\b',re.I)
@@ -66,6 +69,7 @@ def parse_link_window(value):
     except (TypeError,ValueError):return LINK_WINDOW_SECONDS
     return min(seconds,MAX_LINK_WINDOW_SECONDS) if seconds>0 else LINK_WINDOW_SECONDS
 
+@lru_cache(maxsize=128)
 def phrase_pattern(phrase):
     # Whole words only: "MARKET BREAKDOWN" never matches inside "SUPERMARKET BREAKDOWNS".
     return re.compile(r'(?<!\w)'+r'\s+'.join(re.escape(x) for x in phrase.split())+r'(?!\w)',re.I)
@@ -78,10 +82,21 @@ def linkable(source,row):
     if row.get('is_from_me'):return False
     if not (source.get('chat_jid') or '').endswith('@g.us'):return True
     # `sender` is the bridge message row's participant JID.
-    return bool(source.get('sender')) and row.get('sender')==source.get('sender')
+    sender=sender_identity(source.get('sender'))
+    return bool(sender) and sender_identity(row.get('sender'))==sender
+
+def sender_identity(value):
+    """`123`, `123@s.whatsapp.net` and `123:4@s.whatsapp.net` are one sender; `@lid` stays distinct."""
+    user,_,server=(value or '').strip().casefold().partition('@')
+    user=user.partition(':')[0]
+    if not user:return None
+    return user,{'':'s.whatsapp.net','c.us':'s.whatsapp.net'}.get(server,server)
 
 def account_clues(text):
-    return list(dict.fromkeys(re.sub(r'\D','',x) for x in ACCOUNT.findall(text)))[:10]
+    phones=[x.span() for x in PHONE.finditer(text)]
+    found=(re.sub(r'\D','',x.group(0)) for x in ACCOUNT.finditer(text)
+           if not any(start<=x.start() and x.end()<=end for start,end in phones))
+    return list(dict.fromkeys(found))[:10]
 
 def age(source,row):
     try:

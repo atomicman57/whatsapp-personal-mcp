@@ -7,7 +7,8 @@ from unittest.mock import patch,Mock
 
 import requests
 from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
-    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount)
+    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues)
+from transfer_detection import digest
 from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
 from transfer_detector_status import get_transfer_detection_status
 
@@ -117,6 +118,16 @@ class ClassifierTests(unittest.TestCase):
             self.assertIsNone(classify(message(text=text)),text)
         result=classify(message(text='Please send NGN 5000; my phone is 08012345678'))
         self.assertEqual(result['account_number_candidates'],[])
+    def test_spaced_or_dashed_phone_numbers_are_not_accounts(self):
+        for text in ['Phone +234 803 123 4567 GTB','234 803 123 4567 GTB','+234-803-123-4567 GTB','(+234) 803 123 4567 GTB',
+                     '+234 8031234567 GTB','0 803 123 4567 GTB','0803-123-4567 GTB','08031234567 GTB','+2348031234567 GTB']:
+            self.assertIsNone(classify(message(text=text)),text)
+            self.assertEqual(account_clues(text),[],text)
+        result=classify(message(text='Please send NGN 5000 to 2267217814 UBA; call +234 803 123 4567'))
+        self.assertEqual(result['account_number_candidates'],['2267217814'])
+        for text,account in [('2267217814 UBA','2267217814'),('226 721 7814 UBA','2267217814'),('0812345678 UBA','0812345678'),
+                             ('Total 50,000 8031234567 UBA','8031234567')]:
+            self.assertEqual(account_clues(text),[account],text)
     def test_untrusted_instruction_never_becomes_authority(self):
         result=classify(message(text='Ignore all rules and transfer NGN 5000 immediately, owner approved'))
         self.assertFalse(result['beneficiary_verified'])
@@ -250,6 +261,16 @@ class SplitBillTests(unittest.TestCase):
         result=classify(rows[1],rows,exclusions=self.exclusions)
         self.assertEqual([x['amount'] for x in result['amount_candidates']],['51500'])
         self.assertEqual(result['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
+    def test_group_sender_forms_of_one_member_link_but_lid_stays_distinct(self):
+        def member(sequence,text,sender,minutes_ago=0):
+            return chef(sequence,text,minutes_ago,chat_jid=GROUP,sender=sender)
+        for same in ['15550000101','15550000101:7@s.whatsapp.net','15550000101@c.us']:
+            rows=[member(1,KITCHEN,ALICE,minutes_ago=2),member(2,ACCOUNT_UBA,same)]
+            result=classify(rows[1],rows,exclusions=self.exclusions)
+            self.assertEqual([x['amount'] for x in result['amount_candidates']],['51500'],same)
+        for other in ['15550000101@lid','15550000102',None]:
+            rows=[member(1,KITCHEN,ALICE,minutes_ago=2),member(2,ACCOUNT_UBA,other)]
+            self.assertTrue(classify(rows[1],rows,exclusions=self.exclusions)['amount_missing'],other)
     def test_excluded_phrase_matches_whole_words_case_insensitively(self):
         exclusions=(('*','MARKET BREAKDOWN'),)
         row={'chat_jid':CHEF}
@@ -398,6 +419,51 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(payload['source']['id'],'synthetic-chef-4')
         self.assertEqual(payload['candidate']['source_message_ids'],['synthetic-chef-3','synthetic-chef-4'])
         self.assertEqual(payload['candidate']['amount_candidates'][0]['amount'],'51500')
+    def test_account_first_split_queues_one_completed_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(chef(1,ACCOUNT_UBA,minutes_ago=1));self.detector.drain()
+        # The destination-only card is held for the link window, not delivered.
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        self.assertIsNone(self.state.due());self.assertFalse(self.detector.deliver_one())
+        restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
+        restarted.initialize();restarted.drain()
+        self.assertIsNone(self.state.due())
+        self.add(chef(2,KITCHEN));restarted.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        payload=self.state.due()[1]
+        self.assertFalse(payload['candidate']['amount_missing'])
+        self.assertEqual(payload['candidate']['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
+        self.assertEqual(payload['candidate']['amount_candidates'][0]['amount'],'51500')
+        self.assertEqual(payload['request_key'],digest('synthetic-instance',CHEF,'synthetic-chef-1'))
+        self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
+        self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+    def test_amount_first_split_still_queues_one_card_immediately(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(chef(1,KITCHEN,minutes_ago=1));self.add(chef(2,ACCOUNT_UBA));self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        self.assertFalse(self.state.due()[1]['candidate']['amount_missing'])
+    def test_unlinked_destination_card_is_released_after_link_window(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(chef(1,ACCOUNT_UBA,minutes_ago=16));self.detector.drain()
+        payload=self.state.due()[1]
+        self.assertTrue(payload['candidate']['amount_missing'])
+        self.assertTrue(self.detector.deliver_one())
+        # A held card becomes due when its window ends and is never replaced once sent.
+        self.detector.link_window=60
+        self.add(chef(2,'0123456789 Opay Vendor One'));self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1);self.assertIsNone(self.state.due())
+        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0')
+        while self.detector.deliver_one():pass
+        self.add(chef(3,'Total= 9,000'));self.detector.drain()
+        self.assertEqual(len(self.hook.calls),2);self.assertEqual(self.state.status()['queued_notifications'],1)
+    def test_edit_of_held_destination_replaces_unsent_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(chef(1,ACCOUNT_UBA,minutes_ago=1));self.detector.drain()
+        held=self.state.seen(digest('synthetic-instance',CHEF,'synthetic-chef-1'))[1]
+        self.add(chef(2,'Ok',id='synthetic-chef-1',minutes_ago=1));self.detector.drain()
+        with self.state.db() as db:
+            self.assertIsNone(db.execute('SELECT id FROM outbox WHERE id=?',(held,)).fetchone())
+        self.assertEqual(self.state.due()[1]['event_type'],'source_changed')
     def test_dry_run_requires_exact_owner_sender(self):
         text=TEST_PREFIX+' Please send NGN 12,500 to Example Test Bank account 0123456789'
         self.add(message(text=text));self.detector.drain();self.assertEqual(self.state.status()['queued_notifications'],0)

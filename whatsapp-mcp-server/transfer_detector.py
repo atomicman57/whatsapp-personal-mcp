@@ -60,6 +60,9 @@ class State:
                 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,source TEXT NOT NULL,payload TEXT,
                   attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,
                   delivered TEXT,created TEXT NOT NULL,observed TEXT,processing_ms REAL,first_attempt TEXT);''')
+            columns={x[1] for x in db.execute('PRAGMA table_info(outbox)')}
+            if 'request_key' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN request_key TEXT')
+            if 'held' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0')
     @contextmanager
     def db(self):
         connection=sqlite3.connect(self.path,timeout=10)
@@ -82,15 +85,20 @@ class State:
     def seen(self,source):
         with self.lock,self.db() as db:
             return db.execute('SELECT digest,event FROM seen WHERE source=?',(source,)).fetchone()
-    def consume(self,sequence,source,body_digest,payload):
+    def consume(self,sequence,source,body_digest,payload,hold_until=0):
+        """`hold_until` defers an incomplete card; a later card for its request replaces it unsent."""
         with self.lock,self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             if payload:
                 payload=bounded_notification(payload)
+                request_key=payload.get('request_key')
+                db.execute('DELETE FROM outbox WHERE held=1 AND delivered IS NULL AND first_attempt IS NULL AND id!=? AND (request_key=? OR id=?)',
+                           (payload['event_id'],request_key,payload.get('previous_event_id')))
                 count=db.execute('SELECT count(*) FROM outbox WHERE delivered IS NULL').fetchone()[0]
                 if count>=10000:raise RuntimeError('outbox_capacity')
-                db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms) VALUES(?,?,?,?,?,?)',
-                           (payload['event_id'],source,json.dumps(payload),utcnow(),payload.get('detector_observed_at'),payload.get('detector_processing_ms')))
+                db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms,request_key,held,next_attempt) VALUES(?,?,?,?,?,?,?,?,?)',
+                           (payload['event_id'],source,json.dumps(payload),utcnow(),payload.get('detector_observed_at'),payload.get('detector_processing_ms'),
+                            request_key,int(hold_until>0),hold_until))
                 db.execute('INSERT OR REPLACE INTO seen VALUES(?,?,?)',(source,body_digest,payload['event_id']))
             db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',('cursor',json.dumps(sequence)))
             db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',('last_event',json.dumps(utcnow())))
@@ -250,6 +258,15 @@ class Detector:
             'context':cleaned,'context_truncated':truncated or len(row.get('content',''))>2000,
             'context_may_be_incomplete':len(context)>=50 or not any(x['id']==row['id'] for x in rows),
             'dry_run':dry_run,'previous_event_id':prior[1] if prior else None})
+    def hold_until(self,row,payload):
+        """Destination-only cards wait out the link window for a split amount to complete them."""
+        if not payload or payload.get('event_type')!='transfer_request_candidate':return 0
+        candidate=payload.get('candidate') or {}
+        if not (candidate.get('amount_missing') and candidate.get('account_number_candidates')):return 0
+        now=time.time()
+        try:expires=parsed_time(row['timestamp']).timestamp()+self.link_window
+        except (ValueError,TypeError,KeyError):expires=now+self.link_window
+        return min(expires,now+self.link_window) if expires>now else 0
     def drain(self):
         for batch in range(100):
             cursor=self.state.get('cursor')
@@ -263,7 +280,7 @@ class Detector:
                 return
             for row in page['messages']:
                 key,body_hash,payload=self.build(row)
-                self.state.consume(row['sequence'],key,body_hash,payload)
+                self.state.consume(row['sequence'],key,body_hash,payload,self.hold_until(row,payload))
             self.state.set(read_error=None,gap_detected=False)
             if not page['has_more']:return
         self.wake.set()

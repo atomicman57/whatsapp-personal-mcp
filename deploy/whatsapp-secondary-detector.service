@@ -1,0 +1,20 @@
+[Unit]
+Description=Event-driven WhatsApp transfer-request intake (secondary account)
+Requires=docker.service whatsapp-secondary.service
+BindsTo=whatsapp-secondary.service
+PartOf=whatsapp-secondary.service
+After=docker.service whatsapp-secondary.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/whatsapp-secondary/images.env
+ExecStartPre=-/usr/bin/docker rm whatsapp-secondary-detector
+ExecStart=/usr/bin/docker run --name whatsapp-secondary-detector --init --network=container:whatsapp-secondary --user=10150:10150 --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=256m --cpus=0.5 --env-file=/etc/whatsapp-secondary/detector.env --mount=type=bind,src=/var/lib/whatsapp-secondary-detector/data,dst=/state --tmpfs=/tmp:rw,noexec,nosuid,size=32m --entrypoint=python ${WHATSAPP_IMAGE} /app/server/transfer_detector.py
+ExecStop=/usr/bin/docker stop --timeout=15 whatsapp-secondary-detector
+Restart=always
+RestartSec=3
+TimeoutStopSec=25
+
+[Install]
+WantedBy=whatsapp-secondary.service

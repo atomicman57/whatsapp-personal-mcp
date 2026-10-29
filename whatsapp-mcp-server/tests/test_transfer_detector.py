@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import patch,Mock
 
 import requests
-from transfer_detection import classify,amount_clues,safe_context,TEST_PREFIX
+from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
+    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES)
 from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
 from transfer_detector_status import get_transfer_detection_status
 
@@ -123,6 +124,121 @@ class ClassifierTests(unittest.TestCase):
         context,_=safe_context([message(text='OTP 123456'),message(2,'Please send NGN 5000')])
         self.assertEqual(len(context),1)
 
+CHEF='205037695422603@lid'
+MARKET=('Day 7 Thursday MARKET BREAKDOWN\nTomatoes 10k\nPepper 5k\nChicken 26,000\nRice 22,500\nTOTAL==== 63,500')
+KITCHEN=('Kitchen replacements\nFrying pan 18,000\nPlates 10k\nKnife set 23,500\nTotal= 51,500')
+ACCOUNT_UBA='2267217814\nU.B.A'
+
+def chef(sequence,text,minutes_ago=0,**extra):
+    return message(sequence,text,chat_jid=CHEF,id='synthetic-chef-'+str(sequence),
+                   timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat(),**extra)
+
+class SplitBillTests(unittest.TestCase):
+    exclusions=DEFAULT_EXCLUDED_CHAT_PHRASES
+    def run_chat(self,rows):
+        return [classify(row,rows[:i+1],exclusions=self.exclusions) for i,row in enumerate(rows)]
+    def test_dotted_and_spaced_bank_acronyms_normalise(self):
+        for text,bank in [('U.B.A','UBA'),('U.B.A.','UBA'),('u b a','UBA'),('G.T.B','GTB'),('F.C.M.B','FCMB'),('g. t. c. o','GTCO')]:
+            self.assertTrue(has_bank(text),text)
+            self.assertEqual(normalise_banks(text),bank)
+        self.assertEqual(normalise_banks('I a m here'),'I a m here')
+        self.assertFalse(has_bank('a b c'))
+        result=classify(message(text='0123456789 G.T.B Demo Beneficiary'))
+        self.assertEqual(result['bank_name_candidates'],['GTB'])
+        result=classify(message(text='0123456789\nF.C.M.B'))
+        self.assertEqual(result['bank_name_candidates'],['FCMB'])
+    def test_standalone_total_preferred_over_line_items(self):
+        self.assertEqual([x['amount'] for x in amount_clues(MARKET)],['63500'])
+        self.assertEqual([x['amount'] for x in amount_clues(KITCHEN)],['51500'])
+        self.assertEqual(amount_clues('Total: 30,000\nextra 5k\nGrand total - 35k')[0]['amount'],'35000')
+        # An amount-only bill without a destination is not a candidate.
+        self.assertIsNone(classify(chef(1,KITCHEN)))
+    def test_market_breakdown_and_its_account_create_no_candidates(self):
+        rows=[chef(1,MARKET,minutes_ago=5),chef(2,ACCOUNT_UBA)]
+        self.assertEqual(self.run_chat(rows),[None,None])
+        # Without the exclusion the same split pairs, proving the exclusion is what suppresses it.
+        self.exclusions=()
+        result=self.run_chat(rows)[1]
+        self.assertEqual(result['amount_candidates'][0]['amount'],'63500')
+    def test_kitchen_bill_then_account_links_into_one_candidate(self):
+        rows=[chef(1,KITCHEN,minutes_ago=5),chef(2,ACCOUNT_UBA)]
+        bill,account=self.run_chat(rows)
+        self.assertIsNone(bill)
+        self.assertEqual(account['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
+        self.assertEqual([x['amount'] for x in account['amount_candidates']],['51500'])
+        self.assertEqual(account['amount_candidates'][0]['source_message_id'],'synthetic-chef-1')
+        self.assertEqual(account['account_number_candidates'],['2267217814'])
+        self.assertEqual(account['bank_name_candidates'],['UBA'])
+        self.assertFalse(account['amount_missing'])
+        self.assertEqual(account['anchor_message_id'],'synthetic-chef-2')
+    def test_market_then_kitchen_then_account_pairs_only_kitchen(self):
+        rows=[chef(1,MARKET,minutes_ago=10),chef(2,KITCHEN,minutes_ago=5),chef(3,ACCOUNT_UBA)]
+        results=self.run_chat(rows)
+        candidates=[x for x in results if x]
+        self.assertEqual(len(candidates),1)
+        self.assertEqual([x['amount'] for x in candidates[0]['amount_candidates']],['51500'])
+        self.assertEqual(candidates[0]['source_message_ids'],['synthetic-chef-2','synthetic-chef-3'])
+        self.assertNotIn('synthetic-chef-1',json.dumps(candidates[0]))
+        # The spend report's own account reply never adopts a later bill.
+        rows=[chef(1,MARKET,minutes_ago=10),chef(2,ACCOUNT_UBA,minutes_ago=9),chef(3,KITCHEN,minutes_ago=2)]
+        self.assertEqual(self.run_chat(rows),[None,None,None])
+    def test_bill_then_account_then_dotted_bank_in_three_messages(self):
+        rows=[chef(1,KITCHEN,minutes_ago=4),chef(2,'2267217814',minutes_ago=2),chef(3,'u b a')]
+        bill,account,bank=self.run_chat(rows)
+        self.assertIsNone(bill);self.assertIsNone(account)
+        self.assertEqual(bank['source_message_ids'],['synthetic-chef-1','synthetic-chef-2','synthetic-chef-3'])
+        self.assertEqual(bank['amount_candidates'][0]['amount'],'51500')
+        self.assertEqual(bank['account_number_candidates'],['2267217814'])
+        self.assertEqual(bank['bank_name_candidates'],['UBA'])
+    def test_account_first_then_total_links_within_window(self):
+        rows=[chef(1,ACCOUNT_UBA,minutes_ago=5),chef(2,KITCHEN)]
+        account,bill=self.run_chat(rows)
+        self.assertTrue(account['amount_missing'])
+        self.assertEqual(bill['anchor_message_id'],'synthetic-chef-1')
+        self.assertEqual(bill['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
+        self.assertEqual([x['amount'] for x in bill['amount_candidates']],['51500'])
+        self.assertEqual(bill['account_number_candidates'],['2267217814'])
+        self.assertEqual(bill['account_source_message_id'],'synthetic-chef-1')
+        self.assertEqual(bill['bank_name_candidates'],['UBA'])
+        self.assertIn('amount_follow_up',bill['reasons'])
+    def test_fragments_outside_link_window_do_not_pair(self):
+        late=[chef(1,KITCHEN,minutes_ago=20),chef(2,ACCOUNT_UBA)]
+        result=self.run_chat(late)[1]
+        self.assertTrue(result['amount_missing']);self.assertEqual(result['source_message_ids'],['synthetic-chef-2'])
+        self.assertIsNone(self.run_chat([chef(1,ACCOUNT_UBA,minutes_ago=20),chef(2,KITCHEN)])[1])
+        # A wider configured window pairs the same fragments.
+        result=classify(late[1],late,link_window=1800,exclusions=self.exclusions)
+        self.assertEqual(result['amount_candidates'][0]['amount'],'51500')
+        # A real request keeps the wider conversation window.
+        rows=[chef(1,'Please send money for the generator repair',minutes_ago=60),chef(2,ACCOUNT_UBA,minutes_ago=40),chef(3,'Total= 51,500')]
+        self.assertEqual(self.run_chat(rows)[2]['anchor_message_id'],'synthetic-chef-1')
+    def test_split_negatives_stay_negative(self):
+        for text in ['OTP 123456 do not share\nTotal= 51,500','Payment successful\nTotal= 51,500']:
+            self.assertIsNone(classify(chef(2,text),[chef(1,ACCOUNT_UBA,minutes_ago=1)],exclusions=self.exclusions),text)
+        outgoing=chef(1,KITCHEN,minutes_ago=2,is_from_me=True)
+        result=classify(chef(2,ACCOUNT_UBA),[outgoing],exclusions=self.exclusions)
+        self.assertTrue(result['amount_missing'])
+        # A receipt between the bill and account details breaks the link.
+        rows=[chef(1,KITCHEN,minutes_ago=3),chef(2,'Transfer successful',minutes_ago=2),chef(3,ACCOUNT_UBA)]
+        self.assertTrue(self.run_chat(rows)[2]['amount_missing'])
+        # A different destination is never merged with an older bill.
+        rows=[chef(1,KITCHEN,minutes_ago=3),chef(2,'0123456789 Opay Vendor One',minutes_ago=2),chef(3,ACCOUNT_UBA)]
+        self.assertTrue(self.run_chat(rows)[2]['amount_missing'])
+    def test_exclusion_configuration(self):
+        self.assertEqual(parse_excluded_chat_phrases(None),DEFAULT_EXCLUDED_CHAT_PHRASES)
+        self.assertEqual(parse_excluded_chat_phrases('  '),DEFAULT_EXCLUDED_CHAT_PHRASES)
+        self.assertEqual(parse_excluded_chat_phrases('none'),())
+        self.assertEqual(parse_excluded_chat_phrases('a@lid||Market  Breakdown; *||weekly report\n'),
+                         (('a@lid','Market Breakdown'),('*','weekly report')))
+        for value in ['a@lid','||phrase','a@lid||']:
+            with self.assertRaises(ValueError):parse_excluded_chat_phrases(value)
+        self.assertEqual([parse_link_window(x) for x in [None,'abc','0','-5','120','99999']],[900,900,900,900,120,7200])
+        # Phrases match case-insensitively and only in the configured chat.
+        lower=chef(1,'day 7 market   breakdown\ntotal==== 63,500\n2267217814 UBA')
+        self.assertIsNone(classify(lower,exclusions=self.exclusions))
+        self.assertIsNotNone(classify({**lower,'chat_jid':LID},exclusions=self.exclusions))
+        self.assertIsNone(classify({**lower,'chat_jid':LID},exclusions=(('*','market breakdown'),)))
+
 class FakeBridge:
     def __init__(self):self.messages=[];self.context=[];self.calls=[];self.phone=PHONE;self.gap=False
     def get(self,path,params=None):
@@ -221,6 +337,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(fresh.get('cursor'),1);self.assertEqual(fresh.status()['queued_notifications'],0)
         wrong=Detector(fresh,self.bridge,self.hook,'fresh-instance','15550000999')
         with self.assertRaisesRegex(RuntimeError,'account_identity_mismatch'):wrong.initialize()
+    def test_custom_source_account_in_payload_status_and_health_warning(self):
+        detector=Detector(self.state,self.bridge,self.hook,'synthetic-instance','15550000001',source_account='whatsapp-secondary')
+        self.assertEqual(self.state.status()['source_account'],'whatsapp-secondary')
+        self.add(message());detector.drain()
+        self.assertEqual(self.state.due()[1]['source_account'],'whatsapp-secondary')
+        self.bridge.gap=True;self.bridge.messages.append(message(2));detector.drain()
+        with self.state.db() as db:
+            warning=[json.loads(x[0]) for x in db.execute("SELECT payload FROM outbox WHERE source='system'")]
+        self.assertEqual(warning[0]['source_account'],'whatsapp-secondary')
+        with self.assertRaises(ValueError):Detector(self.state,self.bridge,self.hook,'i','1',source_account='bad account!')
+    def test_worker_links_split_bill_and_skips_excluded_spend_report(self):
+        rows=[chef(1,MARKET,minutes_ago=10),chef(2,ACCOUNT_UBA,minutes_ago=9),
+              chef(3,KITCHEN,minutes_ago=2),chef(4,ACCOUNT_UBA)]
+        for row in rows:self.add(row)
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        payload=self.state.due()[1]
+        self.assertEqual(payload['source']['id'],'synthetic-chef-4')
+        self.assertEqual(payload['candidate']['source_message_ids'],['synthetic-chef-3','synthetic-chef-4'])
+        self.assertEqual(payload['candidate']['amount_candidates'][0]['amount'],'51500')
     def test_dry_run_requires_exact_owner_sender(self):
         text=TEST_PREFIX+' Please send NGN 12,500 to Example Test Bank account 0123456789'
         self.add(message(text=text));self.detector.drain();self.assertEqual(self.state.status()['queued_notifications'],0)

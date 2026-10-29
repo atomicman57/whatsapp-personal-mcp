@@ -14,7 +14,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_detection import TEST_PREFIX,classify,digest,safe_context,sensitive,source_digest
+from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
+    parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,source_digest)
+
+DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
 
 def utcnow():return datetime.now(timezone.utc).isoformat()
 def parsed_time(value):
@@ -44,7 +47,8 @@ def bounded_notification(payload,max_bytes=3500):
     return payload
 
 class State:
-    def __init__(self,root):
+    def __init__(self,root,source_account=DEFAULT_SOURCE_ACCOUNT):
+        self.source_account=source_account
         root=Path(root);root.mkdir(parents=True,mode=0o700,exist_ok=True)
         self.path=root/'transfer-detector.sqlite'
         if self.path.is_symlink():raise ValueError('state symlink refused')
@@ -115,7 +119,7 @@ class State:
         with self.lock,self.db() as db:
             pending=db.execute('SELECT count(*) FROM outbox WHERE delivered IS NULL').fetchone()[0]
             sent=db.execute('SELECT count(*) FROM outbox WHERE delivered IS NOT NULL').fetchone()[0]
-        return {'enabled':True,'source_account':'whatsapp-main','queued_notifications':pending,
+        return {'enabled':True,'source_account':self.source_account,'queued_notifications':pending,
                 'accepted_notifications':sent,**{key:self.get(key) for key in
                 ['go_live','stream_connected','last_event','last_webhook_accepted','read_error','delivery_error','gap_detected']},
                 'delivery_semantics':'at-least-once webhook; stable event IDs require receiver deduplication',
@@ -172,8 +176,12 @@ class Webhook:
         except requests.RequestException:return False,'webhook_network_error'
 
 class Detector:
-    def __init__(self,state,bridge,webhook,account,expected_phone,blocked_phones=(),blocked_names=(),test_sender=''):
+    def __init__(self,state,bridge,webhook,account,expected_phone,blocked_phones=(),blocked_names=(),test_sender='',
+                 source_account=DEFAULT_SOURCE_ACCOUNT,link_window=LINK_WINDOW_SECONDS,exclusions=DEFAULT_EXCLUDED_CHAT_PHRASES):
+        if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}',source_account or ''):raise ValueError('invalid source account')
         self.state=state;self.bridge=bridge;self.webhook=webhook
+        self.source_account=state.source_account=source_account
+        self.link_window=link_window;self.exclusions=tuple(exclusions)
         self.account=account;self.expected_phone=expected_phone
         self.blocked=set(blocked_phones);self.names=[x.casefold() for x in blocked_names]
         self.test_sender=test_sender;self.stop=threading.Event();self.wake=threading.Event()
@@ -189,7 +197,7 @@ class Detector:
         source_key=digest(self.account,row['chat_jid'],row['id'])
         body_hash=source_digest(row);prior=self.state.seen(source_key)
         if prior and prior[0]==body_hash:return source_key,body_hash,None
-        base={'event_id':digest(source_key,body_hash),'source_account':'whatsapp-main','source_instance':self.account,
+        base={'event_id':digest(source_key,body_hash),'source_account':self.source_account,'source_instance':self.account,
               'source':{key:row.get(key) for key in ('chat_jid','id','timestamp','is_from_me','chat_name','media_type','filename')},
               'untrusted_evidence':True,'payment_authorized':False}
         base['source']['chat_name']=(row.get('chat_name') or '')[:120]
@@ -218,7 +226,7 @@ class Detector:
         # Unresolved identities get a metadata-only review notification, never a
         # context fetch that could open a specifically excluded person's chat.
         if not phone:
-            clues=classify(row,(),dry_run)
+            clues=classify(row,(),dry_run,self.link_window,self.exclusions)
             if not clues:return skip()
             return source_key,body_hash,timed({**base,'event_type':'identity_review_required','identity_unresolved':True,
                 'source':{key:base['source'].get(key) for key in ('chat_jid','id','timestamp')},'context':[],
@@ -232,7 +240,7 @@ class Detector:
             except (ValueError,TypeError,KeyError):continue
         rows.sort(key=lambda x:(parsed_time(x['timestamp']),x['id']))
         rows=rows[-20:]
-        clues=classify(row,rows,dry_run)
+        clues=classify(row,rows,dry_run,self.link_window,self.exclusions)
         if not clues:return skip()
         cleaned,truncated=safe_context(rows)
         base['source']['content']=(row.get('content') or '')[:2000]
@@ -249,7 +257,7 @@ class Detector:
             if page['gap_detected']:
                 self.state.set(gap_detected=True,read_error='change_feed_gap_requires_review')
                 self.state.enqueue_system({'event_id':digest(self.account,'feed-gap',cursor),
-                    'event_type':'detector_health_warning','source_account':'whatsapp-main',
+                    'event_type':'detector_health_warning','source_account':self.source_account,
                     'reason':'Durable feed retention/cursor gap; automatic intake stopped for owner review.',
                     'payment_authorized':False,'untrusted_evidence':True})
                 return
@@ -304,13 +312,16 @@ def status_server(state,token,port=8755):
 def main():
     os.umask(0o077)
     token=os.environ['WHATSAPP_BRIDGE_READ_TOKEN']
-    state=State(os.environ.get('WHATSAPP_TRANSFER_STATE_DIR','/state'))
+    source_account=os.environ.get('WHATSAPP_TRANSFER_SOURCE_ACCOUNT','').strip() or DEFAULT_SOURCE_ACCOUNT
+    state=State(os.environ.get('WHATSAPP_TRANSFER_STATE_DIR','/state'),source_account)
     bridge=BridgeReader(os.environ.get('WHATSAPP_BRIDGE_URL','http://127.0.0.1:8753/api'),token)
     webhook=Webhook(os.environ['WHATSAPP_TRANSFER_WEBHOOK_URL'],os.environ['WHATSAPP_TRANSFER_WEBHOOK_AUTH_HEADER'],os.environ['WHATSAPP_TRANSFER_WEBHOOK_AUTH_VALUE'])
     detector=Detector(state,bridge,webhook,os.environ['WHATSAPP_BRIDGE_INSTANCE_ID'],os.environ['WHATSAPP_TRANSFER_EXPECTED_PHONE'],
         [x.strip().lstrip('+') for x in os.environ.get('WHATSAPP_TRANSFER_EXCLUDED_PHONES','').split(',') if x.strip()],
         [x.strip() for x in os.environ.get('WHATSAPP_TRANSFER_EXCLUDED_NAMES','').split(',') if x.strip()],
-        os.environ.get('WHATSAPP_TRANSFER_TEST_SENDER',''))
+        os.environ.get('WHATSAPP_TRANSFER_TEST_SENDER',''),source_account,
+        parse_link_window(os.environ.get('WHATSAPP_TRANSFER_LINK_WINDOW_SECONDS')),
+        parse_excluded_chat_phrases(os.environ.get('WHATSAPP_TRANSFER_EXCLUDED_CHAT_PHRASES')))
     server=status_server(state,token)
     for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,lambda *_:(detector.stop.set(),detector.wake.set()))
     try:detector.run()

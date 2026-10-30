@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime,timezone,timedelta
 from pathlib import Path
@@ -7,9 +8,9 @@ from unittest.mock import patch,Mock
 
 import requests
 from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
-    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues)
+    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues,bare_amount)
 from transfer_detection import digest
-from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
+from transfer_detector import Detector,State,Webhook,status_server,bounded_notification,CLAIM_LEASE_SECONDS,WEBHOOK_TIMEOUT
 from transfer_detector_status import get_transfer_detection_status
 
 NOW=datetime.now(timezone.utc)
@@ -36,7 +37,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result['account_number_candidates'],['0123456789'])
         self.assertEqual(result['account_source_message_id'],account['id'])
         self.assertEqual(result['anchor_message_id'],account['id'])
-        later=classify(message(3,'1900'),[account,bank])
+        later=classify(message(3,'1,900'),[account,bank])
         self.assertEqual(later['anchor_message_id'],account['id'])
         self.assertEqual(later['amount_candidates'][0]['amount'],'1900')
         self.assertIsNotNone(classify(account,[message(0,'Moniepoint'),account]))
@@ -46,16 +47,16 @@ class ClassifierTests(unittest.TestCase):
         result=classify(purpose,[details,purpose])
         self.assertEqual(result['anchor_message_id'],details['id'])
         self.assertIn('purpose_follow_up',result['reasons'])
-        result=classify(message(3,'1900'),[details])
+        result=classify(message(3,'1,900'),[details])
         self.assertEqual(result['amount_candidates'][0]['amount'],'1900')
         self.assertIsNone(classify(message(4,'Thanks'),[details]))
     def test_context_window_and_security_codes_do_not_leak_or_link(self):
         details=message(1,'Please send NGN 20,000 for rent',timestamp=(NOW-timedelta(hours=3)).isoformat())
         self.assertIsNone(classify(message(2,'waybill'),[details]))
         other=message(1,'Please send NGN 20,000 for rent',chat_jid='other@lid')
-        self.assertIsNone(classify(message(2,'1900'),[other]))
+        self.assertIsNone(classify(message(2,'5000'),[other]))
         future=message(1,'Please send NGN 20,000 for rent',timestamp=(NOW+timedelta(minutes=1)).isoformat())
-        self.assertIsNone(classify(message(2,'1900'),[future]))
+        self.assertIsNone(classify(message(2,'5000'),[future]))
         code=message(2,'Your Access Code: 123456; please send NGN 5000')
         self.assertIsNone(classify(code))
         self.assertEqual(safe_context([code])[0],[])
@@ -65,8 +66,8 @@ class ClassifierTests(unittest.TestCase):
         result=classify(bank,[account,bank],dry_run=True)
         self.assertEqual(result['account_number_candidates'],['0123456789'])
         self.assertEqual(result['anchor_message_id'],account['id'])
-        self.assertIsNone(classify(message(3,'1900'),[account,bank]))
-        self.assertIsNone(classify(message(4,TEST_PREFIX+' 1900'),[message(1,'Please send NGN 5000')],dry_run=True))
+        self.assertIsNone(classify(message(3,'5000'),[account,bank]))
+        self.assertIsNone(classify(message(4,TEST_PREFIX+' 5000'),[message(1,'Please send NGN 5000')],dry_run=True))
     def test_new_vendor_does_not_inherit_prior_destination_or_amount(self):
         old=message(1,'0123456789 Opay Vendor One 7k')
         new=message(2,'0987654321 Moniepoint Vendor Two')
@@ -76,14 +77,14 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(result['amount_missing'])
         account=message(3,'0111122223')
         bank=message(4,'Sterling Vendor Three')
-        amount=message(5,'1900')
+        amount=message(5,'5000')
         for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
             result=classify(source,context)
             self.assertEqual(result['anchor_message_id'],account['id'])
             if source!=amount:self.assertTrue(result['amount_missing'])
     def test_five_part_conversation_retains_original_request_anchor(self):
         rows=[message(1,'Please send money for plumbing repairs'),message(2,'012 345 6789'),
-              message(3,'Sterling Demo Beneficiary'),message(4,'1900'),message(5,'waybill')]
+              message(3,'Sterling Demo Beneficiary'),message(4,'1,900'),message(5,'waybill')]
         for i,row in enumerate(rows):
             result=classify(row,rows[:i+1])
             self.assertIsNotNone(result)
@@ -144,6 +145,20 @@ GROUP='120363000000000001@g.us';ALICE='15550000101@s.whatsapp.net';BOB='15550000
 def chef(sequence,text,minutes_ago=0,**extra):
     return {**message(sequence,text,chat_jid=CHEF,id='synthetic-chef-'+str(sequence),
                       timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat()),**extra}
+
+# Itemised quote -> separate bare total -> owner asks -> account details (no TOTAL keyword, no currency).
+VENDOR='99900002@lid'
+QUOTE=('Full Goat 80,000\nHalf Cow 150,000\nChicken x5 45,000\nTurkey 60,000\nAssorted 52,000\nDelivery 8000')
+STANBIC_NEWLINES='0063417132\nDEMO MEAT VENDOR NAIJA\nSTANBIC IBTC'
+STANBIC_SLASHES='0063417132/DEMO MEAT VENDOR NAIJA/STANBIC IBTC'
+
+def vendor(sequence,text,minutes_ago=0,**extra):
+    return {**message(sequence,text,chat_jid=VENDOR,id='synthetic-vendor-'+str(sequence),
+                      timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat()),**extra}
+
+def vendor_sequence(account_text):
+    return [vendor(1,QUOTE,minutes_ago=6),vendor(2,'395,000',minutes_ago=4.5),
+            vendor(3,'Account details',minutes_ago=1.5,is_from_me=True),vendor(4,account_text)]
 
 class SplitBillTests(unittest.TestCase):
     exclusions=DEFAULT_EXCLUDED_CHAT_PHRASES
@@ -279,6 +294,99 @@ class SplitBillTests(unittest.TestCase):
         self.assertFalse(excluded(row,'SUPERMARKET BREAKDOWNEXTRA',exclusions))
         self.assertFalse(excluded(row,'supermarket breakdown',exclusions))
         self.assertFalse(excluded(row,'market breakdowns',exclusions))
+    def test_bare_total_after_itemised_quote_completes_account_details(self):
+        # Neither message alone carries a recognised amount clue.
+        self.assertEqual(amount_clues(QUOTE),[]);self.assertEqual(amount_clues('395,000'),[])
+        for account_text in (STANBIC_NEWLINES,STANBIC_SLASHES):
+            results=self.run_chat(vendor_sequence(account_text))
+            candidates=[x for x in results if x]
+            self.assertEqual(len(candidates),1,account_text)
+            result=results[3]
+            self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000'])
+            self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-2')
+            self.assertEqual(result['account_number_candidates'],['0063417132'])
+            self.assertEqual(result['bank_name_candidates'],['Stanbic'])
+            self.assertFalse(result['amount_missing']);self.assertFalse(result['amount_ambiguous'])
+            self.assertEqual(result['source_message_ids'],['synthetic-vendor-2','synthetic-vendor-4'])
+    def test_bare_total_preferred_over_nearer_line_item_list(self):
+        listed='Goat ₦80,000\nCow ₦150,000'
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['395000'])
+        # Without a bare total the line items remain the (ambiguous) candidates.
+        result=self.run_chat(rows[1:])[1]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['80000','150000'])
+        self.assertTrue(result['amount_ambiguous'])
+        # A single-amount message nearer than the bare total still wins.
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'Balance ₦50,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['50000'])
+    def test_bare_numbers_that_are_not_totals_do_not_link(self):
+        for text in ('0123456789','0','12345678901234567890123'):
+            rows=[vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)]
+            self.assertTrue(self.run_chat(rows)[1]['amount_missing'],text)
+        # A bare total outside the link window does not pair.
+        rows=[vendor(1,'395,000',minutes_ago=20),vendor(2,STANBIC_NEWLINES)]
+        self.assertTrue(self.run_chat(rows)[1]['amount_missing'])
+        # Nor does one sent by the owner.
+        rows=[vendor(1,'395,000',minutes_ago=2,is_from_me=True),vendor(2,STANBIC_NEWLINES)]
+        self.assertTrue(self.run_chat(rows)[1]['amount_missing'])
+        # A bare total alone is not a candidate.
+        self.assertIsNone(classify(vendor(1,'395,000'),[vendor(0,QUOTE,minutes_ago=1)]))
+    def test_bare_amount_acceptance_rule(self):
+        for text,amount in (('395000','395000'),('395,000','395000'),('1,500','1500'),('395,000.','395000'),
+                            ('395,000 ✅','395000'),('395,000!!','395000'),(' 1,500.50 👍🏽 ','1500.50'),('50000','50000')):
+            self.assertEqual([x['amount'] for x in bare_amount(text)],[amount],text)
+        for text in ('2026','123456','5','1430','1500','08031234567','2348031234567','0123456789','01000',
+                     '2,026,00','1,50','0,500','395,000 thanks','395,000 ✅ for the goat','2000'):
+            self.assertEqual(bare_amount(text),[],text)
+        # A reply to an established request also takes small amounts, never years/codes/times/phones.
+        for text,amount in (('500','500'),('2,500','2500'),('1,900','1900'),('5000','5000'),('395000','395000'),('750.50','750.50')):
+            self.assertEqual([x['amount'] for x in bare_amount(text,strict=False)],[amount],text)
+        for text in ('2026','1900','2000','123456','1430','1500','5','99','08031234567','2348031234567','0123456789','0500','1,50'):
+            self.assertEqual(bare_amount(text,strict=False),[],text)
+    def test_bare_totals_link_but_years_codes_quantities_and_phones_hold(self):
+        for text,amount in (('395000','395000'),('395,000','395000'),('1,500','1500'),('395,000.','395000'),('395,000 ✅','395000')):
+            result=self.run_chat([vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+            self.assertEqual([x['amount'] for x in result['amount_candidates']],[amount],text)
+            self.assertFalse(result['amount_missing'],text)
+        for text in ('2026','123456','5','08031234567'):
+            result=self.run_chat([vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+            self.assertTrue(result['amount_missing'],text);self.assertEqual(result['amount_candidates'],[],text)
+        # A bare total from a different group member never completes another's details.
+        def member(sequence,text,sender,minutes_ago=0):
+            return chef(sequence,text,minutes_ago,chat_jid=GROUP,sender=sender)
+        rows=[member(1,'395,000',ALICE,minutes_ago=2),member(2,STANBIC_NEWLINES,BOB)]
+        self.assertTrue(classify(rows[1],rows,exclusions=self.exclusions)['amount_missing'])
+        rows=[member(1,'395,000',ALICE,minutes_ago=2),member(2,STANBIC_NEWLINES,ALICE)]
+        self.assertEqual(classify(rows[1],rows,exclusions=self.exclusions)['amount_candidates'][0]['amount'],'395000')
+    def test_competing_bare_totals_hold_but_repeated_total_completes(self):
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'410,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertTrue(result['amount_missing']);self.assertEqual(result['amount_candidates'],[])
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'395,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000'])
+        self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-2')
+        self.assertFalse(result['amount_missing']);self.assertFalse(result['amount_ambiguous'])
+        # A competitor outside the window or behind another destination does not count.
+        rows=[vendor(1,'410,000',minutes_ago=20),vendor(2,'395,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['395000'])
+        rows=[vendor(1,'410,000',minutes_ago=5),vendor(2,ACCOUNT_UBA,minutes_ago=4),vendor(3,'395,000',minutes_ago=2),vendor(4,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[3]['amount_candidates']],['395000'])
+    def test_amount_parses_keep_exact_values(self):
+        self.assertEqual([x['amount'] for x in bare_amount('395,000.50')],['395000.50'])
+        for text in ('395k','₦395,000','N395,000'):
+            self.assertEqual([x['amount'] for x in amount_clues(text)],['395000'],text)
+        result=self.run_chat([vendor(1,'395,000.50',minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000.50'])
+    def test_older_single_amount_beats_nearer_line_item_list(self):
+        listed='Goat ₦80,000\nCow ₦150,000'
+        rows=[vendor(1,'Balance ₦50,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['50000'])
+        self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-1')
+        # A bare total still wins over both the list and the single amount.
+        rows=[vendor(0,'Balance ₦50,000',minutes_ago=6),vendor(1,'395,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[3]['amount_candidates']],['395000'])
     def test_linked_amount_skips_rows_with_unreadable_timestamps(self):
         source=chef(3,'2267217814')
         ordered=[chef(2,'Total= 9,999',timestamp='not-a-time'),chef(1,KITCHEN,minutes_ago=2)]
@@ -437,6 +545,177 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(payload['request_key'],digest('synthetic-instance',CHEF,'synthetic-chef-1'))
         self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
         self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+    def test_meat_market_quote_bare_total_and_account_queue_one_completed_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        for row in vendor_sequence(STANBIC_NEWLINES):self.add(row)
+        self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        with self.state.db() as db:
+            self.assertEqual(db.execute('SELECT held FROM outbox').fetchall(),[(0,)])
+        payload=self.state.due()[1]
+        self.assertEqual(payload['source']['id'],'synthetic-vendor-4')
+        candidate=payload['candidate']
+        self.assertFalse(candidate['amount_missing'])
+        self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
+        self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+        self.assertEqual(candidate['bank_name_candidates'],['Stanbic'])
+        self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
+        self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+    def test_account_first_then_bare_total_replaces_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+        self.assertIsNone(self.state.due())
+        self.add(vendor(2,'395,000'));self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        candidate=self.state.due()[1]['candidate']
+        self.assertFalse(candidate['amount_missing'])
+        self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
+        self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+    def test_account_then_year_code_digit_or_phone_reply_stays_amount_missing(self):
+        for text in ('2026','123456','5','08031234567'):
+            self.setUp()
+            self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+            self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+            self.add(vendor(2,text));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+            with self.state.db() as db:
+                (payload,held),=db.execute('SELECT payload,held FROM outbox WHERE delivered IS NULL').fetchall()
+            self.assertEqual(held,1,text)
+            self.assertEqual(json.loads(payload)['source']['id'],'synthetic-vendor-1',text)
+            self.assertTrue(json.loads(payload)['candidate']['amount_missing'],text)
+    def test_account_then_small_or_real_amount_reply_completes(self):
+        for text,amount in (('1,900','1900'),('5000','5000'),('500','500'),('2,500','2500')):
+            self.setUp()
+            self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+            self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+            self.add(vendor(2,text));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+            candidate=self.state.due()[1]['candidate']
+            self.assertFalse(candidate['amount_missing'],text)
+            self.assertEqual([x['amount'] for x in candidate['amount_candidates']],[amount],text)
+            self.assertEqual(candidate['account_number_candidates'],['0063417132'],text)
+    def test_receipt_cancels_only_that_chats_unsent_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
+        self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],2);self.assertIsNone(self.state.due())
+        for sequence,text,extra in ((3,'Payment successful',{}),(4,'Already paid, send the receipt',{'is_from_me':True})):
+            self.add(vendor(sequence,text,minutes_ago=1,**extra));self.detector.drain()
+            with self.state.db() as db:
+                left=[json.loads(x[0])['source']['chat_jid'] for x in db.execute('SELECT payload FROM outbox WHERE delivered IS NULL')]
+            self.assertEqual(left,[CHEF])
+        # The other chat's split still completes normally.
+        self.add(chef(5,KITCHEN));self.detector.drain()
+        payload=self.state.due()[1]
+        self.assertEqual(payload['source']['chat_jid'],CHEF)
+        self.assertFalse(payload['candidate']['amount_missing'])
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+    def test_pre_payment_receipt_requests_do_not_cancel_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
+        for sequence,text in enumerate(('please send the receipt after you pay','Send me the receipt','transaction reference'),2):
+            self.add(vendor(sequence,text,minutes_ago=1,is_from_me=sequence%2==0));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+        for text in ("Here's the receipt","I've paid",'Proof of payment attached','Transfer completed'):
+            self.assertTrue(self.detector.settles(vendor(9,text)),text)
+        for text in ('please send the receipt after you pay','Send proof of payment once you have paid','transaction reference?',
+                     'notify me if payment successful',"don't send receipt until I've paid",'not payment successful',
+                     'Tell me when payment received','Ping me once transfer completed',"I haven't paid",
+                     'unless payment confirmed, hold it'):
+            self.assertFalse(self.detector.settles(vendor(9,text)),text)
+            self.assertFalse(self.detector.settles(vendor(9,text,is_from_me=True)),text)
+        # Either side settles; a negation in an earlier sentence does not block a later confirmation.
+        for text in ('Payment successful','Already paid, send the receipt',
+                     'Not sure you saw. Payment received'):
+            self.assertTrue(self.detector.settles(vendor(9,text,is_from_me=True)),text)
+            self.assertTrue(self.detector.settles(vendor(9,text)),text)
+    def test_racing_workers_send_a_due_card_exactly_once(self):
+        self.add(message());self.detector.drain()
+        states=[State(self.directory.name),State(self.directory.name)];barrier=threading.Barrier(2);lock=threading.Lock()
+        sent=[]
+        class Recording:
+            def send(self,key,payload):
+                with lock:sent.append(key)
+                return True,None
+        def worker(state):
+            # Both workers see the row due, then both finish claiming before either sends.
+            due,claim=state.due,state.attempt_started
+            def due_then_wait():
+                item=due();barrier.wait(5);return item
+            def claim_then_wait(key):
+                claimed=claim(key);barrier.wait(5);return claimed
+            with patch.object(state,'due',due_then_wait),patch.object(state,'attempt_started',claim_then_wait):
+                Detector(state,self.bridge,Recording(),'synthetic-instance','15550000001').deliver_one()
+        threads=[threading.Thread(target=worker,args=(state,)) for state in states]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(10)
+        self.assertEqual(len(sent),1)
+        self.assertEqual(self.state.status()['queued_notifications'],0)
+    def test_failed_send_releases_claim_for_retry(self):
+        self.add(message());self.detector.drain();key=self.state.due()[0]
+        self.hook.fail=True;self.assertTrue(self.detector.deliver_one())
+        with self.state.db() as db:
+            self.assertIsNone(db.execute('SELECT first_attempt FROM outbox WHERE id=?',(key,)).fetchone()[0])
+            db.execute('UPDATE outbox SET next_attempt=0')
+        self.hook.fail=False;self.assertTrue(self.detector.deliver_one())
+        self.assertEqual([x[0] for x in self.hook.calls],[key,key])
+        self.assertEqual(self.state.status()['queued_notifications'],0)
+    def test_live_claim_survives_new_state_and_stale_claim_is_resent_once(self):
+        self.assertGreater(CLAIM_LEASE_SECONDS,sum(WEBHOOK_TIMEOUT))
+        self.add(message());self.detector.drain();key=self.state.due()[0]
+        sent=[];claimed=threading.Event();release=threading.Event()
+        class Blocking:
+            def send(self,key,payload):
+                sent.append(key);claimed.set();release.wait(5);return True,None
+        # Worker A claims and blocks mid-send; a new State (MCP tool, CLI, second process) must not free its claim.
+        worker=threading.Thread(target=Detector(self.state,self.bridge,Blocking(),'synthetic-instance','15550000001').deliver_one)
+        worker.start();self.assertTrue(claimed.wait(5))
+        other=State(self.directory.name);self.assertIsNone(other.due());self.assertIsNone(other.attempt_started(key))
+        self.assertFalse(Detector(other,self.bridge,Blocking(),'synthetic-instance','15550000001').deliver_one())
+        release.set();worker.join(5)
+        self.assertEqual(sent,[key]);self.assertEqual(self.state.status()['queued_notifications'],0)
+        # A claim stranded by a crash mid-send becomes due again once older than the lease, and is resent once.
+        self.add(message(2,'Please send NGN 9,000 for paint. Bank: Demo Bank. Account 0123456780.',id='message-2'))
+        self.detector.drain();key=self.state.due()[0]
+        self.assertTrue(self.state.attempt_started(key));self.assertIsNone(State(self.directory.name).due())
+        stale=(datetime.now(timezone.utc)-timedelta(seconds=CLAIM_LEASE_SECONDS+5)).isoformat()
+        with self.state.db() as db:db.execute('UPDATE outbox SET first_attempt=? WHERE id=?',(stale,key))
+        restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
+        self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
+        self.assertEqual([x[0] for x in self.hook.calls],[key])
+        # A worker whose stale claim was taken over does not release the new holder's claim on failure.
+        self.add(message(3,'Please send NGN 7,000 for tiles. Bank: Demo Bank. Account 0123456781.',id='message-3'))
+        self.detector.drain();key=self.state.due()[0];self.state.attempt_started(key)
+        with self.state.db() as db:db.execute('UPDATE outbox SET first_attempt=? WHERE id=?',(stale,key))
+        current=self.state.attempt_started(key);self.assertTrue(current)
+        self.state.failed(key,0,'webhook_network_error',stale)
+        with self.state.db() as db:
+            self.assertEqual(db.execute('SELECT first_attempt,attempts FROM outbox WHERE id=?',(key,)).fetchone(),(current,0))
+    def test_card_cancelled_after_due_is_not_sent(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
+        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0')
+        due=self.state.due
+        def due_then_cancelled():
+            item=due();self.state.cancel_held(VENDOR);return item
+        with patch.object(self.state,'due',due_then_cancelled):self.assertTrue(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls,[])
+        self.assertEqual(self.state.status()['queued_notifications'],0)
+    def test_split_completion_or_timeout_in_one_chat_leaves_other_chats_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
+        self.detector.drain()
+        vendor_held=self.state.seen(digest('synthetic-instance',VENDOR,'synthetic-vendor-1'))[1]
+        self.add(chef(3,KITCHEN));self.detector.drain()
+        with self.state.db() as db:
+            rows=dict(db.execute('SELECT id,held FROM outbox WHERE delivered IS NULL').fetchall())
+        self.assertEqual(rows[vendor_held],1);self.assertEqual(len(rows),2)
+        # The completed chef card goes out; the vendor card stays held until its own window ends.
+        self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls[0][1]['source']['chat_jid'],CHEF)
+        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0 WHERE id=?',(vendor_held,))
+        self.assertTrue(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls[1][0],vendor_held)
     def test_amount_first_split_still_queues_one_card_immediately(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,KITCHEN,minutes_ago=1));self.add(chef(2,ACCOUNT_UBA));self.detector.drain()

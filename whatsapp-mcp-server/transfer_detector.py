@@ -65,6 +65,8 @@ class State:
             columns={x[1] for x in db.execute('PRAGMA table_info(outbox)')}
             if 'request_key' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN request_key TEXT')
             if 'held' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0')
+            # A claim left by a crash mid-send (or a pre-exclusive-claim database) is released for retry.
+            db.execute('UPDATE outbox SET first_attempt=NULL WHERE delivered IS NULL')
     @contextmanager
     def db(self):
         connection=sqlite3.connect(self.path,timeout=10)
@@ -114,7 +116,7 @@ class State:
         return len(stale)
     def due(self):
         with self.lock,self.db() as db:
-            row=db.execute('SELECT id,payload,attempts FROM outbox WHERE delivered IS NULL AND next_attempt<=? ORDER BY rowid LIMIT 1',(time.time(),)).fetchone()
+            row=db.execute('SELECT id,payload,attempts FROM outbox WHERE delivered IS NULL AND first_attempt IS NULL AND next_attempt<=? ORDER BY rowid LIMIT 1',(time.time(),)).fetchone()
         return (row[0],json.loads(row[1]),row[2]) if row else None
     def delivered(self,key):
         with self.lock,self.db() as db:
@@ -122,9 +124,10 @@ class State:
             db.execute('UPDATE outbox SET payload=NULL,delivered=? WHERE id=?',(utcnow(),key))
         self.set(last_webhook_accepted=utcnow(),delivery_error=None)
     def attempt_started(self,key):
-        """Claim a due row; False if it was delivered or cancelled (cancel_held) since `due()`."""
+        """Exclusively claim a due row; False if another worker claimed it or it was delivered or cancelled since `due()`."""
         with self.lock,self.db() as db:
-            return db.execute('UPDATE outbox SET first_attempt=COALESCE(first_attempt,?) WHERE id=? AND delivered IS NULL',
+            db.execute('BEGIN IMMEDIATE')
+            return db.execute('UPDATE outbox SET first_attempt=? WHERE id=? AND delivered IS NULL AND first_attempt IS NULL',
                               (utcnow(),key)).rowcount==1
     def enqueue_system(self,payload):
         with self.lock,self.db() as db:
@@ -132,7 +135,8 @@ class State:
                        (payload['event_id'],'system',json.dumps(payload),utcnow()))
     def failed(self,key,attempts,code):
         with self.lock,self.db() as db:
-            db.execute('UPDATE outbox SET attempts=?,next_attempt=? WHERE id=?',
+            # Release the claim so the backoff retry can reclaim it.
+            db.execute('UPDATE outbox SET attempts=?,next_attempt=?,first_attempt=NULL WHERE id=?',
                        (attempts+1,time.time()+min(300,2**min(attempts+1,9)),key))
         self.set(delivery_error=code)
     def status(self):

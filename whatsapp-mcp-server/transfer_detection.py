@@ -222,8 +222,9 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     A standalone bare total ("395,000") is preferred over a nearer list of
     several line-item amounts, the vendor quote -> total -> account pattern.
     While hunting past such a list only other multi-item lists are skipped;
-    an older single clear amount still beats the list."""
-    fallback=None
+    an older single clear amount still beats the list. Two different bare
+    totals in the window are ambiguous and link nothing (amount_missing)."""
+    fallback=None;nearest_bare=None;bare_values=set()
     for row in ordered:
         if row.get('is_from_me') or row['id']==skip_id:continue
         elapsed=age(source,row)
@@ -236,12 +237,20 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
         bare=bare_amount(body)
         found=amount_clues(body) or bare
         if not found:continue
+        if nearest_bare:
+            # Only look for a competing bare total; stop where the original walk would.
+            if excluded(row,body,exclusions):break
+            if bare:bare_values.add(bare[0]['amount'])
+            continue
         clear=bool(bare or len(found)==1 or total_clue(body))
         if fallback and not clear:continue
         if excluded(row,body,exclusions):return (fallback,False) if fallback else (None,True)
         found=[{**x,'source_message_id':row['id']} for x in found]
+        if bare:
+            nearest_bare=found;bare_values.add(bare[0]['amount']);continue
         if clear:return found,False
         fallback=found
+    if nearest_bare:return ([],False) if len(bare_values)>1 else (nearest_bare,False)
     return fallback,False
 
 def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=()):

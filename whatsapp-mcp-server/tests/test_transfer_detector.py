@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime,timezone,timedelta
 from pathlib import Path
@@ -357,6 +358,26 @@ class SplitBillTests(unittest.TestCase):
         self.assertTrue(classify(rows[1],rows,exclusions=self.exclusions)['amount_missing'])
         rows=[member(1,'395,000',ALICE,minutes_ago=2),member(2,STANBIC_NEWLINES,ALICE)]
         self.assertEqual(classify(rows[1],rows,exclusions=self.exclusions)['amount_candidates'][0]['amount'],'395000')
+    def test_competing_bare_totals_hold_but_repeated_total_completes(self):
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'410,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertTrue(result['amount_missing']);self.assertEqual(result['amount_candidates'],[])
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'395,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000'])
+        self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-2')
+        self.assertFalse(result['amount_missing']);self.assertFalse(result['amount_ambiguous'])
+        # A competitor outside the window or behind another destination does not count.
+        rows=[vendor(1,'410,000',minutes_ago=20),vendor(2,'395,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['395000'])
+        rows=[vendor(1,'410,000',minutes_ago=5),vendor(2,ACCOUNT_UBA,minutes_ago=4),vendor(3,'395,000',minutes_ago=2),vendor(4,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[3]['amount_candidates']],['395000'])
+    def test_amount_parses_keep_exact_values(self):
+        self.assertEqual([x['amount'] for x in bare_amount('395,000.50')],['395000.50'])
+        for text in ('395k','₦395,000','N395,000'):
+            self.assertEqual([x['amount'] for x in amount_clues(text)],['395000'],text)
+        result=self.run_chat([vendor(1,'395,000.50',minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000.50'])
     def test_older_single_amount_beats_nearer_line_item_list(self):
         listed='Goat ₦80,000\nCow ₦150,000'
         rows=[vendor(1,'Balance ₦50,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
@@ -608,6 +629,43 @@ class RuntimeTests(unittest.TestCase):
                      'Not sure you saw. Payment received'):
             self.assertTrue(self.detector.settles(vendor(9,text,is_from_me=True)),text)
             self.assertTrue(self.detector.settles(vendor(9,text)),text)
+    def test_racing_workers_send_a_due_card_exactly_once(self):
+        self.add(message());self.detector.drain()
+        states=[State(self.directory.name),State(self.directory.name)];barrier=threading.Barrier(2);lock=threading.Lock()
+        sent=[]
+        class Recording:
+            def send(self,key,payload):
+                with lock:sent.append(key)
+                return True,None
+        def worker(state):
+            # Both workers see the row due, then both finish claiming before either sends.
+            due,claim=state.due,state.attempt_started
+            def due_then_wait():
+                item=due();barrier.wait(5);return item
+            def claim_then_wait(key):
+                claimed=claim(key);barrier.wait(5);return claimed
+            with patch.object(state,'due',due_then_wait),patch.object(state,'attempt_started',claim_then_wait):
+                Detector(state,self.bridge,Recording(),'synthetic-instance','15550000001').deliver_one()
+        threads=[threading.Thread(target=worker,args=(state,)) for state in states]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(10)
+        self.assertEqual(len(sent),1)
+        self.assertEqual(self.state.status()['queued_notifications'],0)
+    def test_failed_send_releases_claim_for_retry(self):
+        self.add(message());self.detector.drain();key=self.state.due()[0]
+        self.hook.fail=True;self.assertTrue(self.detector.deliver_one())
+        with self.state.db() as db:
+            self.assertIsNone(db.execute('SELECT first_attempt FROM outbox WHERE id=?',(key,)).fetchone()[0])
+            db.execute('UPDATE outbox SET next_attempt=0')
+        self.hook.fail=False;self.assertTrue(self.detector.deliver_one())
+        self.assertEqual([x[0] for x in self.hook.calls],[key,key])
+        self.assertEqual(self.state.status()['queued_notifications'],0)
+        # A claim stranded by a crash mid-send is released on restart rather than blocking the outbox.
+        self.add(message(2,'Please send NGN 9,000 for paint. Bank: Demo Bank. Account 0123456780.',id='message-2'))
+        self.detector.drain();key=self.state.due()[0]
+        self.assertTrue(self.state.attempt_started(key));self.assertIsNone(self.state.due())
+        restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
+        self.assertTrue(restarted.deliver_one());self.assertEqual(self.hook.calls[-1][0],key)
     def test_card_cancelled_after_due_is_not_sent(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()

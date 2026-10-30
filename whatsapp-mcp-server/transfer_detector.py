@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
+from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,RECEIPT,TEST_PREFIX,classify,digest,
     parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,source_digest)
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
@@ -59,7 +59,9 @@ class State:
                 CREATE TABLE IF NOT EXISTS seen(source TEXT PRIMARY KEY,digest TEXT NOT NULL,event TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,source TEXT NOT NULL,payload TEXT,
                   attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,
-                  delivered TEXT,created TEXT NOT NULL,observed TEXT,processing_ms REAL,first_attempt TEXT);''')
+                  delivered TEXT,created TEXT NOT NULL,observed TEXT,processing_ms REAL,first_attempt TEXT,
+                  request_key TEXT,held INTEGER NOT NULL DEFAULT 0);''')
+            # Databases created before these columns existed.
             columns={x[1] for x in db.execute('PRAGMA table_info(outbox)')}
             if 'request_key' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN request_key TEXT')
             if 'held' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0')
@@ -102,6 +104,14 @@ class State:
                 db.execute('INSERT OR REPLACE INTO seen VALUES(?,?,?)',(source,body_digest,payload['event_id']))
             db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',('cursor',json.dumps(sequence)))
             db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',('last_event',json.dumps(utcnow())))
+    def cancel_held(self,chat_jid):
+        """Drop this chat's unsent held cards; a receipt means the request is already settled."""
+        with self.lock,self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows=db.execute('SELECT id,payload FROM outbox WHERE held=1 AND delivered IS NULL AND first_attempt IS NULL').fetchall()
+            stale=[key for key,payload in rows if payload and (json.loads(payload).get('source') or {}).get('chat_jid')==chat_jid]
+            db.executemany('DELETE FROM outbox WHERE id=?',[(key,) for key in stale])
+        return len(stale)
     def due(self):
         with self.lock,self.db() as db:
             row=db.execute('SELECT id,payload,attempts FROM outbox WHERE delivered IS NULL AND next_attempt<=? ORDER BY rowid LIMIT 1',(time.time(),)).fetchone()
@@ -267,6 +277,12 @@ class Detector:
         try:expires=parsed_time(row['timestamp']).timestamp()+self.link_window
         except (ValueError,TypeError,KeyError):expires=now+self.link_window
         return min(expires,now+self.link_window) if expires>now else 0
+    def settles(self,row):
+        """A live receipt/"already paid" from either side settles the chat's pending split."""
+        text=row.get('content') or ''
+        if row.get('deleted') or not RECEIPT.search(text) or sensitive(text) or text.startswith(TEST_PREFIX):return False
+        try:return parsed_time(row['timestamp'])>=parsed_time(self.state.get('go_live'))
+        except (ValueError,TypeError,KeyError,AttributeError):return False
     def drain(self):
         for batch in range(100):
             cursor=self.state.get('cursor')
@@ -279,6 +295,7 @@ class Detector:
                     'payment_authorized':False,'untrusted_evidence':True})
                 return
             for row in page['messages']:
+                if self.settles(row):self.state.cancel_held(row['chat_jid'])
                 key,body_hash,payload=self.build(row)
                 self.state.consume(row['sequence'],key,body_hash,payload,self.hold_until(row,payload))
             self.state.set(read_error=None,gap_detected=False)

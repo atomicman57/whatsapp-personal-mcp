@@ -145,6 +145,20 @@ def chef(sequence,text,minutes_ago=0,**extra):
     return {**message(sequence,text,chat_jid=CHEF,id='synthetic-chef-'+str(sequence),
                       timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat()),**extra}
 
+# Itemised quote -> separate bare total -> owner asks -> account details (no TOTAL keyword, no currency).
+VENDOR='99900002@lid'
+QUOTE=('Full Goat 80,000\nHalf Cow 150,000\nChicken x5 45,000\nTurkey 60,000\nAssorted 52,000\nDelivery 8000')
+STANBIC_NEWLINES='0063417132\nDEMO MEAT VENDOR NAIJA\nSTANBIC IBTC'
+STANBIC_SLASHES='0063417132/DEMO MEAT VENDOR NAIJA/STANBIC IBTC'
+
+def vendor(sequence,text,minutes_ago=0,**extra):
+    return {**message(sequence,text,chat_jid=VENDOR,id='synthetic-vendor-'+str(sequence),
+                      timestamp=(NOW-timedelta(minutes=minutes_ago)).isoformat()),**extra}
+
+def vendor_sequence(account_text):
+    return [vendor(1,QUOTE,minutes_ago=6),vendor(2,'395,000',minutes_ago=4.5),
+            vendor(3,'Account details',minutes_ago=1.5,is_from_me=True),vendor(4,account_text)]
+
 class SplitBillTests(unittest.TestCase):
     exclusions=DEFAULT_EXCLUDED_CHAT_PHRASES
     def run_chat(self,rows):
@@ -279,6 +293,43 @@ class SplitBillTests(unittest.TestCase):
         self.assertFalse(excluded(row,'SUPERMARKET BREAKDOWNEXTRA',exclusions))
         self.assertFalse(excluded(row,'supermarket breakdown',exclusions))
         self.assertFalse(excluded(row,'market breakdowns',exclusions))
+    def test_bare_total_after_itemised_quote_completes_account_details(self):
+        # Neither message alone carries a recognised amount clue.
+        self.assertEqual(amount_clues(QUOTE),[]);self.assertEqual(amount_clues('395,000'),[])
+        for account_text in (STANBIC_NEWLINES,STANBIC_SLASHES):
+            results=self.run_chat(vendor_sequence(account_text))
+            candidates=[x for x in results if x]
+            self.assertEqual(len(candidates),1,account_text)
+            result=results[3]
+            self.assertEqual([x['amount'] for x in result['amount_candidates']],['395000'])
+            self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-2')
+            self.assertEqual(result['account_number_candidates'],['0063417132'])
+            self.assertEqual(result['bank_name_candidates'],['Stanbic'])
+            self.assertFalse(result['amount_missing']);self.assertFalse(result['amount_ambiguous'])
+            self.assertEqual(result['source_message_ids'],['synthetic-vendor-2','synthetic-vendor-4'])
+    def test_bare_total_preferred_over_nearer_line_item_list(self):
+        listed='Goat ₦80,000\nCow ₦150,000'
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['395000'])
+        # Without a bare total the line items remain the (ambiguous) candidates.
+        result=self.run_chat(rows[1:])[1]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['80000','150000'])
+        self.assertTrue(result['amount_ambiguous'])
+        # A single-amount message nearer than the bare total still wins.
+        rows=[vendor(1,'395,000',minutes_ago=4),vendor(2,'Balance ₦50,000',minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[2]['amount_candidates']],['50000'])
+    def test_bare_numbers_that_are_not_totals_do_not_link(self):
+        for text in ('0123456789','0','12345678901234567890123'):
+            rows=[vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)]
+            self.assertTrue(self.run_chat(rows)[1]['amount_missing'],text)
+        # A bare total outside the link window does not pair.
+        rows=[vendor(1,'395,000',minutes_ago=20),vendor(2,STANBIC_NEWLINES)]
+        self.assertTrue(self.run_chat(rows)[1]['amount_missing'])
+        # Nor does one sent by the owner.
+        rows=[vendor(1,'395,000',minutes_ago=2,is_from_me=True),vendor(2,STANBIC_NEWLINES)]
+        self.assertTrue(self.run_chat(rows)[1]['amount_missing'])
+        # A bare total alone is not a candidate.
+        self.assertIsNone(classify(vendor(1,'395,000'),[vendor(0,QUOTE,minutes_ago=1)]))
     def test_linked_amount_skips_rows_with_unreadable_timestamps(self):
         source=chef(3,'2267217814')
         ordered=[chef(2,'Total= 9,999',timestamp='not-a-time'),chef(1,KITCHEN,minutes_ago=2)]
@@ -437,6 +488,63 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(payload['request_key'],digest('synthetic-instance',CHEF,'synthetic-chef-1'))
         self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
         self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+    def test_meat_market_quote_bare_total_and_account_queue_one_completed_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        for row in vendor_sequence(STANBIC_NEWLINES):self.add(row)
+        self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        with self.state.db() as db:
+            self.assertEqual(db.execute('SELECT held FROM outbox').fetchall(),[(0,)])
+        payload=self.state.due()[1]
+        self.assertEqual(payload['source']['id'],'synthetic-vendor-4')
+        candidate=payload['candidate']
+        self.assertFalse(candidate['amount_missing'])
+        self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
+        self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+        self.assertEqual(candidate['bank_name_candidates'],['Stanbic'])
+        self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
+        self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+    def test_account_first_then_bare_total_replaces_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+        self.assertIsNone(self.state.due())
+        self.add(vendor(2,'395,000'));self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+        candidate=self.state.due()[1]['candidate']
+        self.assertFalse(candidate['amount_missing'])
+        self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
+        self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+    def test_receipt_cancels_only_that_chats_unsent_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
+        self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],2);self.assertIsNone(self.state.due())
+        for sequence,text,extra in ((3,'Payment successful',{}),(4,'Already paid, send the receipt',{'is_from_me':True})):
+            self.add(vendor(sequence,text,minutes_ago=1,**extra));self.detector.drain()
+            with self.state.db() as db:
+                left=[json.loads(x[0])['source']['chat_jid'] for x in db.execute('SELECT payload FROM outbox WHERE delivered IS NULL')]
+            self.assertEqual(left,[CHEF])
+        # The other chat's split still completes normally.
+        self.add(chef(5,KITCHEN));self.detector.drain()
+        payload=self.state.due()[1]
+        self.assertEqual(payload['source']['chat_jid'],CHEF)
+        self.assertFalse(payload['candidate']['amount_missing'])
+        self.assertEqual(self.state.status()['queued_notifications'],1)
+    def test_split_completion_or_timeout_in_one_chat_leaves_other_chats_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
+        self.detector.drain()
+        vendor_held=self.state.seen(digest('synthetic-instance',VENDOR,'synthetic-vendor-1'))[1]
+        self.add(chef(3,KITCHEN));self.detector.drain()
+        with self.state.db() as db:
+            rows=dict(db.execute('SELECT id,held FROM outbox WHERE delivered IS NULL').fetchall())
+        self.assertEqual(rows[vendor_held],1);self.assertEqual(len(rows),2)
+        # The completed chef card goes out; the vendor card stays held until its own window ends.
+        self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls[0][1]['source']['chat_jid'],CHEF)
+        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0 WHERE id=?',(vendor_held,))
+        self.assertTrue(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls[1][0],vendor_held)
     def test_amount_first_split_still_queues_one_card_immediately(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,KITCHEN,minutes_ago=1));self.add(chef(2,ACCOUNT_UBA));self.detector.drain()

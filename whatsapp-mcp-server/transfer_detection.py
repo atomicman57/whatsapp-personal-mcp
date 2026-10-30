@@ -157,6 +157,16 @@ def amount_clues(text):
             result.append({'text':match.group(1)[:100],'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False})
     return result[:10]
 
+def bare_amount(text):
+    """A whole message that is only a number, e.g. a vendor's separate "395,000" total."""
+    if not re.fullmatch(r'\s*\d[\d,]*(?:\.\d{1,2})?\s*',text or ''):return []
+    value=text.strip().replace(',','')
+    if len(value)>20 or len(value.split('.')[0])==10:return []
+    try:number=Decimal(value)
+    except InvalidOperation:return []
+    if not 0<number<=Decimal('1000000000000'):return []
+    return [{'text':text.strip(),'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False}]
+
 def sensitive(text):
     return bool(SECURITY.search(text or ''))
 
@@ -164,7 +174,11 @@ def request_language(text):
     return bool(ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
 
 def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
-    """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded)."""
+    """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded).
+
+    A standalone bare total ("395,000") is preferred over a nearer list of
+    several line-item amounts, the vendor quote -> total -> account pattern."""
+    fallback=None
     for row in ordered:
         if row.get('is_from_me') or row['id']==skip_id:continue
         elapsed=age(source,row)
@@ -174,11 +188,15 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
         row_accounts=account_clues(body)
         # Stop at another destination; its amount is not ours.
         if row_accounts and set(row_accounts)!=set(accounts):break
-        found=amount_clues(body)
+        bare=bare_amount(body)
+        if fallback and not bare:continue
+        found=amount_clues(body) or bare
         if not found:continue
-        if excluded(row,body,exclusions):return None,True
-        return [{**x,'source_message_id':row['id']} for x in found],False
-    return None,False
+        if excluded(row,body,exclusions):return (fallback,False) if fallback else (None,True)
+        found=[{**x,'source_message_id':row['id']} for x in found]
+        if bare or len(found)==1 or total_clue(body):return found,False
+        fallback=found
+    return fallback,False
 
 def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=()):
     """Return evidence for a possible request; false positives need bot/owner review."""
@@ -229,10 +247,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions)
         if from_excluded:return None
         amounts=found or []
-    if previous and not amounts and re.fullmatch(r'\s*\d[\d,]*(?:\.\d{1,2})?\s*',text):
-        value=text.strip().replace(',','')
-        if len(value)<=20 and len(value.split('.')[0])!=10 and 0<Decimal(value)<=Decimal('1000000000000'):
-            amounts=[{'text':text.strip(),'amount':format(Decimal(value),'f'),'currency_hint':None,'currency_explicit':False}]
+    if previous and not amounts:amounts=bare_amount(text)
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []

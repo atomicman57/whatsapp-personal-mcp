@@ -10,7 +10,13 @@ ACCOUNT = re.compile(r'(?<!\d)(?:\d{10}|\d{3}[ -]\d{3}[ -]\d{4}|\d{4}[ -]\d{3}[ 
 PHONE = re.compile(r'(?:(?<![\w+])\(?\+?234\)?|(?<![\w,.])0)[ \t-]*[789]\d{2}[ -]?\d{3}[ -]?\d{4}(?!\d)')
 SECURITY = re.compile(r'\b(?:otp|one[- ]time(?: password| code)?|verification code|login code|access code|gate code|door code|password|passcode|secret pin|do not share|authentication code)\b',re.I)
 SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test bank|transfer_detector_test)\b',re.I)
-RECEIPT = re.compile(r'\b(?:send (?:me )?(?:the )?receipt|proof of payment|payment (?:successful|received|completed)|transfer (?:successful|completed)|transaction reference|money (?:received|has arrived)|already paid)\b',re.I)
+# Past-tense confirmation that a payment happened; settles a chat's pending split.
+# A pre-payment ask ("please send the receipt after you pay") is not settlement.
+SETTLED = re.compile(r"\b(?:payment (?:successful|received|completed|confirmed)|transfer (?:successful|completed)|transaction successful|"
+                     r"money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
+                     r"(?:here['’]?s|here is|attached is|find attached) (?:the |my |your )?(?:receipt|proof of payment)|(?:receipt|proof of payment) attached)\b",re.I)
+# Any receipt talk, including pre-payment asks, is never itself a transfer request.
+RECEIPT = re.compile(SETTLED.pattern+r"|\b(?:send (?:me )?(?:the )?receipt|proof of payment|transaction reference)\b",re.I)
 ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|assist|help me|i need|we need|balance|settle|deposit|owe)\b',re.I)
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
 BANK = re.compile(r'\b(?:bank|acct|account number|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
@@ -157,14 +163,35 @@ def amount_clues(text):
             result.append({'text':match.group(1)[:100],'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False})
     return result[:10]
 
-def bare_amount(text):
-    """A whole message that is only a number, e.g. a vendor's separate "395,000" total."""
-    if not re.fullmatch(r'\s*\d[\d,]*(?:\.\d{1,2})?\s*',text or ''):return []
-    value=text.strip().replace(',','')
-    if len(value)>20 or len(value.split('.')[0])==10:return []
-    try:number=Decimal(value)
+# A short trailing run of punctuation/emoji ("395,000.", "395,000 ✅"), never prose.
+BARE_NUMBER = re.compile(r'\s*(\d(?:[\d,]*\d)?(?:\.\d{1,2})?)[\s.,!?;:\u2600-\u27bf\ufe0f\u200d\U0001f000-\U0001faff]{0,6}')
+GROUPED = re.compile(r'[1-9]\d{0,2}(?:,\d{3})+')
+WHOLE_THOUSANDS = re.compile(r'[1-9]\d*000')
+
+def bare_amount(text,strict=True):
+    """A whole message that is only a money-shaped number, e.g. a vendor's separate "395,000" total.
+
+    Strict (linking a bare number back onto later account details), ambiguous
+    numbers stay amount_missing rather than being guessed:
+    - with thousands separators the integer part must be correctly grouped and
+      at least 1,000 ("1,500", "395,000");
+    - without separators it must be whole thousands with no leading zero
+      ("395000", "50000"), so OTPs/codes/times/quantities ("123456", "1430",
+      "5") never link;
+    - never a calendar year 1900-2099.
+    Lenient (`strict=False`) is a number replying to an established request or
+    account, where the conversation already says money ("1900" after a name).
+    Both reject 10-digit NUBANs and phone numbers, and allow a ".dd" fraction."""
+    match=BARE_NUMBER.fullmatch(text or '')
+    if not match:return []
+    raw=match.group(1);whole=raw.split('.')[0];digits=whole.replace(',','')
+    if len(raw)>20 or len(digits)==10 or PHONE.fullmatch(digits):return []
+    if strict:
+        if not (GROUPED.fullmatch(whole) if ',' in whole else WHOLE_THOUSANDS.fullmatch(whole)):return []
+        if ',' not in whole and 1900<=int(digits)<=2099:return []
+    try:number=Decimal(raw.replace(',',''))
     except InvalidOperation:return []
-    if not 0<number<=Decimal('1000000000000'):return []
+    if not 0<number<=Decimal('1000000000000') or (strict and number<1000):return []
     return [{'text':text.strip(),'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False}]
 
 def sensitive(text):
@@ -177,7 +204,9 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded).
 
     A standalone bare total ("395,000") is preferred over a nearer list of
-    several line-item amounts, the vendor quote -> total -> account pattern."""
+    several line-item amounts, the vendor quote -> total -> account pattern.
+    While hunting past such a list only other multi-item lists are skipped;
+    an older single clear amount still beats the list."""
     fallback=None
     for row in ordered:
         if row.get('is_from_me') or row['id']==skip_id:continue
@@ -189,12 +218,13 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
         # Stop at another destination; its amount is not ours.
         if row_accounts and set(row_accounts)!=set(accounts):break
         bare=bare_amount(body)
-        if fallback and not bare:continue
         found=amount_clues(body) or bare
         if not found:continue
+        clear=bool(bare or len(found)==1 or total_clue(body))
+        if fallback and not clear:continue
         if excluded(row,body,exclusions):return (fallback,False) if fallback else (None,True)
         found=[{**x,'source_message_id':row['id']} for x in found]
-        if bare or len(found)==1 or total_clue(body):return found,False
+        if clear:return found,False
         fallback=found
     return fallback,False
 
@@ -210,7 +240,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     window=timedelta(seconds=link_window)
     ordered=[]
     for row in reversed(context):
-        if RECEIPT.search(row.get('content') or ''):break
+        if SETTLED.search(row.get('content') or ''):break
         # Outgoing rows and other group members are never either half of a link.
         if linkable(source,row):ordered.append(row)
     def spent(i,row):
@@ -247,7 +277,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions)
         if from_excluded:return None
         amounts=found or []
-    if previous and not amounts:amounts=bare_amount(text)
+    if previous and not amounts:amounts=bare_amount(text,strict=False)
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []

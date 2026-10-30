@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,RECEIPT,TEST_PREFIX,classify,digest,
+from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,SETTLED,TEST_PREFIX,classify,digest,
     parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,source_digest)
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
@@ -122,8 +122,10 @@ class State:
             db.execute('UPDATE outbox SET payload=NULL,delivered=? WHERE id=?',(utcnow(),key))
         self.set(last_webhook_accepted=utcnow(),delivery_error=None)
     def attempt_started(self,key):
+        """Claim a due row; False if it was delivered or cancelled (cancel_held) since `due()`."""
         with self.lock,self.db() as db:
-            db.execute('UPDATE outbox SET first_attempt=COALESCE(first_attempt,?) WHERE id=?',(utcnow(),key))
+            return db.execute('UPDATE outbox SET first_attempt=COALESCE(first_attempt,?) WHERE id=? AND delivered IS NULL',
+                              (utcnow(),key)).rowcount==1
     def enqueue_system(self,payload):
         with self.lock,self.db() as db:
             db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created) VALUES(?,?,?,?)',
@@ -280,7 +282,7 @@ class Detector:
     def settles(self,row):
         """A live receipt/"already paid" from either side settles the chat's pending split."""
         text=row.get('content') or ''
-        if row.get('deleted') or not RECEIPT.search(text) or sensitive(text) or text.startswith(TEST_PREFIX):return False
+        if row.get('deleted') or not SETTLED.search(text) or sensitive(text) or text.startswith(TEST_PREFIX):return False
         try:return parsed_time(row['timestamp'])>=parsed_time(self.state.get('go_live'))
         except (ValueError,TypeError,KeyError,AttributeError):return False
     def drain(self):
@@ -305,7 +307,7 @@ class Detector:
         item=self.state.due()
         if not item:return False
         key,payload,attempts=item
-        self.state.attempt_started(key)
+        if not self.state.attempt_started(key):return True
         success,code=self.webhook.send(key,payload)
         if success:self.state.delivered(key)
         else:self.state.failed(key,attempts,code)

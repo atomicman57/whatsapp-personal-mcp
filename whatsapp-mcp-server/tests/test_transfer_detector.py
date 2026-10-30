@@ -7,7 +7,7 @@ from unittest.mock import patch,Mock
 
 import requests
 from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
-    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues)
+    parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues,bare_amount)
 from transfer_detection import digest
 from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
 from transfer_detector_status import get_transfer_detection_status
@@ -330,6 +330,40 @@ class SplitBillTests(unittest.TestCase):
         self.assertTrue(self.run_chat(rows)[1]['amount_missing'])
         # A bare total alone is not a candidate.
         self.assertIsNone(classify(vendor(1,'395,000'),[vendor(0,QUOTE,minutes_ago=1)]))
+    def test_bare_amount_acceptance_rule(self):
+        for text,amount in (('395000','395000'),('395,000','395000'),('1,500','1500'),('395,000.','395000'),
+                            ('395,000 ✅','395000'),('395,000!!','395000'),(' 1,500.50 👍🏽 ','1500.50'),('50000','50000')):
+            self.assertEqual([x['amount'] for x in bare_amount(text)],[amount],text)
+        for text in ('2026','123456','5','1430','1500','08031234567','2348031234567','0123456789','01000',
+                     '2,026,00','1,50','0,500','395,000 thanks','395,000 ✅ for the goat','2000'):
+            self.assertEqual(bare_amount(text),[],text)
+        # A reply to an established request keeps the conversational "1900" format, never a phone.
+        self.assertEqual(bare_amount('1900',strict=False)[0]['amount'],'1900')
+        self.assertEqual(bare_amount('08031234567',strict=False),[])
+    def test_bare_totals_link_but_years_codes_quantities_and_phones_hold(self):
+        for text,amount in (('395000','395000'),('395,000','395000'),('1,500','1500'),('395,000.','395000'),('395,000 ✅','395000')):
+            result=self.run_chat([vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+            self.assertEqual([x['amount'] for x in result['amount_candidates']],[amount],text)
+            self.assertFalse(result['amount_missing'],text)
+        for text in ('2026','123456','5','08031234567'):
+            result=self.run_chat([vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
+            self.assertTrue(result['amount_missing'],text);self.assertEqual(result['amount_candidates'],[],text)
+        # A bare total from a different group member never completes another's details.
+        def member(sequence,text,sender,minutes_ago=0):
+            return chef(sequence,text,minutes_ago,chat_jid=GROUP,sender=sender)
+        rows=[member(1,'395,000',ALICE,minutes_ago=2),member(2,STANBIC_NEWLINES,BOB)]
+        self.assertTrue(classify(rows[1],rows,exclusions=self.exclusions)['amount_missing'])
+        rows=[member(1,'395,000',ALICE,minutes_ago=2),member(2,STANBIC_NEWLINES,ALICE)]
+        self.assertEqual(classify(rows[1],rows,exclusions=self.exclusions)['amount_candidates'][0]['amount'],'395000')
+    def test_older_single_amount_beats_nearer_line_item_list(self):
+        listed='Goat ₦80,000\nCow ₦150,000'
+        rows=[vendor(1,'Balance ₦50,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        result=self.run_chat(rows)[2]
+        self.assertEqual([x['amount'] for x in result['amount_candidates']],['50000'])
+        self.assertEqual(result['amount_candidates'][0]['source_message_id'],'synthetic-vendor-1')
+        # A bare total still wins over both the list and the single amount.
+        rows=[vendor(0,'Balance ₦50,000',minutes_ago=6),vendor(1,'395,000',minutes_ago=4),vendor(2,listed,minutes_ago=2),vendor(3,STANBIC_NEWLINES)]
+        self.assertEqual([x['amount'] for x in self.run_chat(rows)[3]['amount_candidates']],['395000'])
     def test_linked_amount_skips_rows_with_unreadable_timestamps(self):
         source=chef(3,'2267217814')
         ordered=[chef(2,'Total= 9,999',timestamp='not-a-time'),chef(1,KITCHEN,minutes_ago=2)]
@@ -530,6 +564,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(payload['source']['chat_jid'],CHEF)
         self.assertFalse(payload['candidate']['amount_missing'])
         self.assertEqual(self.state.status()['queued_notifications'],1)
+    def test_pre_payment_receipt_requests_do_not_cancel_held_card(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
+        for sequence,text in enumerate(('please send the receipt after you pay','Send me the receipt','transaction reference'),2):
+            self.add(vendor(sequence,text,minutes_ago=1,is_from_me=sequence%2==0));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+        for text in ("Here's the receipt","I've paid",'Proof of payment attached','Transfer completed'):
+            self.assertTrue(self.detector.settles(vendor(9,text)),text)
+        for text in ('please send the receipt after you pay','Send proof of payment once you have paid','transaction reference?'):
+            self.assertFalse(self.detector.settles(vendor(9,text)),text)
+    def test_card_cancelled_after_due_is_not_sent(self):
+        self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+        self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
+        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0')
+        due=self.state.due
+        def due_then_cancelled():
+            item=due();self.state.cancel_held(VENDOR);return item
+        with patch.object(self.state,'due',due_then_cancelled):self.assertTrue(self.detector.deliver_one())
+        self.assertEqual(self.hook.calls,[])
+        self.assertEqual(self.state.status()['queued_notifications'],0)
     def test_split_completion_or_timeout_in_one_chat_leaves_other_chats_held_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))

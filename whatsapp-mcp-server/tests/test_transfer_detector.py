@@ -36,7 +36,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result['account_number_candidates'],['0123456789'])
         self.assertEqual(result['account_source_message_id'],account['id'])
         self.assertEqual(result['anchor_message_id'],account['id'])
-        later=classify(message(3,'1900'),[account,bank])
+        later=classify(message(3,'1,900'),[account,bank])
         self.assertEqual(later['anchor_message_id'],account['id'])
         self.assertEqual(later['amount_candidates'][0]['amount'],'1900')
         self.assertIsNotNone(classify(account,[message(0,'Moniepoint'),account]))
@@ -46,16 +46,16 @@ class ClassifierTests(unittest.TestCase):
         result=classify(purpose,[details,purpose])
         self.assertEqual(result['anchor_message_id'],details['id'])
         self.assertIn('purpose_follow_up',result['reasons'])
-        result=classify(message(3,'1900'),[details])
+        result=classify(message(3,'1,900'),[details])
         self.assertEqual(result['amount_candidates'][0]['amount'],'1900')
         self.assertIsNone(classify(message(4,'Thanks'),[details]))
     def test_context_window_and_security_codes_do_not_leak_or_link(self):
         details=message(1,'Please send NGN 20,000 for rent',timestamp=(NOW-timedelta(hours=3)).isoformat())
         self.assertIsNone(classify(message(2,'waybill'),[details]))
         other=message(1,'Please send NGN 20,000 for rent',chat_jid='other@lid')
-        self.assertIsNone(classify(message(2,'1900'),[other]))
+        self.assertIsNone(classify(message(2,'5000'),[other]))
         future=message(1,'Please send NGN 20,000 for rent',timestamp=(NOW+timedelta(minutes=1)).isoformat())
-        self.assertIsNone(classify(message(2,'1900'),[future]))
+        self.assertIsNone(classify(message(2,'5000'),[future]))
         code=message(2,'Your Access Code: 123456; please send NGN 5000')
         self.assertIsNone(classify(code))
         self.assertEqual(safe_context([code])[0],[])
@@ -65,8 +65,8 @@ class ClassifierTests(unittest.TestCase):
         result=classify(bank,[account,bank],dry_run=True)
         self.assertEqual(result['account_number_candidates'],['0123456789'])
         self.assertEqual(result['anchor_message_id'],account['id'])
-        self.assertIsNone(classify(message(3,'1900'),[account,bank]))
-        self.assertIsNone(classify(message(4,TEST_PREFIX+' 1900'),[message(1,'Please send NGN 5000')],dry_run=True))
+        self.assertIsNone(classify(message(3,'5000'),[account,bank]))
+        self.assertIsNone(classify(message(4,TEST_PREFIX+' 5000'),[message(1,'Please send NGN 5000')],dry_run=True))
     def test_new_vendor_does_not_inherit_prior_destination_or_amount(self):
         old=message(1,'0123456789 Opay Vendor One 7k')
         new=message(2,'0987654321 Moniepoint Vendor Two')
@@ -76,14 +76,14 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(result['amount_missing'])
         account=message(3,'0111122223')
         bank=message(4,'Sterling Vendor Three')
-        amount=message(5,'1900')
+        amount=message(5,'5000')
         for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
             result=classify(source,context)
             self.assertEqual(result['anchor_message_id'],account['id'])
             if source!=amount:self.assertTrue(result['amount_missing'])
     def test_five_part_conversation_retains_original_request_anchor(self):
         rows=[message(1,'Please send money for plumbing repairs'),message(2,'012 345 6789'),
-              message(3,'Sterling Demo Beneficiary'),message(4,'1900'),message(5,'waybill')]
+              message(3,'Sterling Demo Beneficiary'),message(4,'1,900'),message(5,'waybill')]
         for i,row in enumerate(rows):
             result=classify(row,rows[:i+1])
             self.assertIsNotNone(result)
@@ -337,9 +337,11 @@ class SplitBillTests(unittest.TestCase):
         for text in ('2026','123456','5','1430','1500','08031234567','2348031234567','0123456789','01000',
                      '2,026,00','1,50','0,500','395,000 thanks','395,000 ✅ for the goat','2000'):
             self.assertEqual(bare_amount(text),[],text)
-        # A reply to an established request keeps the conversational "1900" format, never a phone.
-        self.assertEqual(bare_amount('1900',strict=False)[0]['amount'],'1900')
-        self.assertEqual(bare_amount('08031234567',strict=False),[])
+        # A reply to an established request also takes small amounts, never years/codes/times/phones.
+        for text,amount in (('500','500'),('2,500','2500'),('1,900','1900'),('5000','5000'),('395000','395000'),('750.50','750.50')):
+            self.assertEqual([x['amount'] for x in bare_amount(text,strict=False)],[amount],text)
+        for text in ('2026','1900','2000','123456','1430','1500','5','99','08031234567','2348031234567','0123456789','0500','1,50'):
+            self.assertEqual(bare_amount(text,strict=False),[],text)
     def test_bare_totals_link_but_years_codes_quantities_and_phones_hold(self):
         for text,amount in (('395000','395000'),('395,000','395000'),('1,500','1500'),('395,000.','395000'),('395,000 ✅','395000')):
             result=self.run_chat([vendor(1,text,minutes_ago=2),vendor(2,STANBIC_NEWLINES)])[1]
@@ -548,6 +550,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(candidate['amount_missing'])
         self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
         self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+    def test_account_then_year_code_digit_or_phone_reply_stays_amount_missing(self):
+        for text in ('2026','123456','5','08031234567'):
+            self.setUp()
+            self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+            self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+            self.add(vendor(2,text));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+            with self.state.db() as db:
+                (payload,held),=db.execute('SELECT payload,held FROM outbox WHERE delivered IS NULL').fetchall()
+            self.assertEqual(held,1,text)
+            self.assertEqual(json.loads(payload)['source']['id'],'synthetic-vendor-1',text)
+            self.assertTrue(json.loads(payload)['candidate']['amount_missing'],text)
+    def test_account_then_small_or_real_amount_reply_completes(self):
+        for text,amount in (('1,900','1900'),('5000','5000'),('500','500'),('2,500','2500')):
+            self.setUp()
+            self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
+            self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
+            self.add(vendor(2,text));self.detector.drain()
+            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+            candidate=self.state.due()[1]['candidate']
+            self.assertFalse(candidate['amount_missing'],text)
+            self.assertEqual([x['amount'] for x in candidate['amount_candidates']],[amount],text)
+            self.assertEqual(candidate['account_number_candidates'],['0063417132'],text)
     def test_receipt_cancels_only_that_chats_unsent_held_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
@@ -572,8 +597,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(self.state.status()['queued_notifications'],1,text)
         for text in ("Here's the receipt","I've paid",'Proof of payment attached','Transfer completed'):
             self.assertTrue(self.detector.settles(vendor(9,text)),text)
-        for text in ('please send the receipt after you pay','Send proof of payment once you have paid','transaction reference?'):
+        for text in ('please send the receipt after you pay','Send proof of payment once you have paid','transaction reference?',
+                     'notify me if payment successful',"don't send receipt until I've paid",'not payment successful',
+                     'Tell me when payment received','Ping me once transfer completed',"I haven't paid",
+                     'unless payment confirmed, hold it'):
             self.assertFalse(self.detector.settles(vendor(9,text)),text)
+            self.assertFalse(self.detector.settles(vendor(9,text,is_from_me=True)),text)
+        # Either side settles; a negation in an earlier sentence does not block a later confirmation.
+        for text in ('Payment successful','Already paid, send the receipt',
+                     'Not sure you saw. Payment received'):
+            self.assertTrue(self.detector.settles(vendor(9,text,is_from_me=True)),text)
+            self.assertTrue(self.detector.settles(vendor(9,text)),text)
     def test_card_cancelled_after_due_is_not_sent(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()

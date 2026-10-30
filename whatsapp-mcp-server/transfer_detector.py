@@ -14,8 +14,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,SETTLED,TEST_PREFIX,classify,digest,
-    parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,source_digest)
+from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
+    parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,settled,source_digest)
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
 
@@ -282,7 +282,7 @@ class Detector:
     def settles(self,row):
         """A live receipt/"already paid" from either side settles the chat's pending split."""
         text=row.get('content') or ''
-        if row.get('deleted') or not SETTLED.search(text) or sensitive(text) or text.startswith(TEST_PREFIX):return False
+        if row.get('deleted') or not settled(text) or sensitive(text) or text.startswith(TEST_PREFIX):return False
         try:return parsed_time(row['timestamp'])>=parsed_time(self.state.get('go_live'))
         except (ValueError,TypeError,KeyError,AttributeError):return False
     def drain(self):

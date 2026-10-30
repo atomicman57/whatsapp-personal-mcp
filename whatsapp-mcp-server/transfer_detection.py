@@ -15,6 +15,9 @@ SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test ba
 SETTLED = re.compile(r"\b(?:payment (?:successful|received|completed|confirmed)|transfer (?:successful|completed)|transaction successful|"
                      r"money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
                      r"(?:here['’]?s|here is|attached is|find attached) (?:the |my |your )?(?:receipt|proof of payment)|(?:receipt|proof of payment) attached)\b",re.I)
+# "if/when/until/once/unless/not/n't" shortly before the phrase, in the same
+# sentence, makes it a condition or denial ("notify me if payment successful").
+UNSETTLED = re.compile(r"\b(?:if|when|until|once|unless|not)\b|n['’]t\b",re.I)
 # Any receipt talk, including pre-payment asks, is never itself a transfer request.
 RECEIPT = re.compile(SETTLED.pattern+r"|\b(?:send (?:me )?(?:the )?receipt|proof of payment|transaction reference)\b",re.I)
 ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|assist|help me|i need|we need|balance|settle|deposit|owe)\b',re.I)
@@ -171,28 +174,41 @@ WHOLE_THOUSANDS = re.compile(r'[1-9]\d*000')
 def bare_amount(text,strict=True):
     """A whole message that is only a money-shaped number, e.g. a vendor's separate "395,000" total.
 
-    Strict (linking a bare number back onto later account details), ambiguous
-    numbers stay amount_missing rather than being guessed:
-    - with thousands separators the integer part must be correctly grouped and
-      at least 1,000 ("1,500", "395,000");
-    - without separators it must be whole thousands with no leading zero
-      ("395000", "50000"), so OTPs/codes/times/quantities ("123456", "1430",
-      "5") never link;
-    - never a calendar year 1900-2099.
-    Lenient (`strict=False`) is a number replying to an established request or
-    account, where the conversation already says money ("1900" after a name).
-    Both reject 10-digit NUBANs and phone numbers, and allow a ".dd" fraction."""
+    Ambiguous numbers stay amount_missing rather than being guessed. Both modes:
+    - reject 10-digit NUBANs and phone numbers;
+    - with thousands separators require correct grouping ("1,500", "395,000");
+    - without separators reject calendar years 1900-2099 and 4-6 digit values
+      that are not whole thousands, so years/OTPs/times ("2026", "123456",
+      "1430") never count. Separator-less "2000" is therefore a year; a real
+      ₦2000 needs "2,000";
+    - allow a ".dd" fraction.
+    Strict (linking a bare number back onto later account details) also needs
+    at least 1,000 and, without separators, whole thousands with no leading
+    zero ("395000", "50000"). Lenient (`strict=False`) is a reply to an
+    established request or account and accepts small amounts from 100 ("500",
+    "2,500"), never single digits like "5"."""
     match=BARE_NUMBER.fullmatch(text or '')
     if not match:return []
     raw=match.group(1);whole=raw.split('.')[0];digits=whole.replace(',','')
     if len(raw)>20 or len(digits)==10 or PHONE.fullmatch(digits):return []
-    if strict:
-        if not (GROUPED.fullmatch(whole) if ',' in whole else WHOLE_THOUSANDS.fullmatch(whole)):return []
-        if ',' not in whole and 1900<=int(digits)<=2099:return []
+    if ',' in whole:
+        if not GROUPED.fullmatch(whole):return []
+    else:
+        # Year band: separator-less "2000" is rejected too; a real ₦2000 needs "2,000".
+        if 1900<=int(digits)<=2099:return []
+        if (strict or 4<=len(digits)<=6) and not WHOLE_THOUSANDS.fullmatch(whole):return []
     try:number=Decimal(raw.replace(',',''))
     except InvalidOperation:return []
-    if not 0<number<=Decimal('1000000000000') or (strict and number<1000):return []
+    if not 0<number<=Decimal('1000000000000') or number<(1000 if strict else 100):return []
     return [{'text':text.strip(),'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False}]
+
+def settled(text):
+    """Past-tense settlement not preceded by a nearby conditional or negation."""
+    text=text or ''
+    for match in SETTLED.finditer(text):
+        before=re.split(r'[.!?\n]',text[max(0,match.start()-30):match.start()])[-1]
+        if not UNSETTLED.search(before):return True
+    return False
 
 def sensitive(text):
     return bool(SECURITY.search(text or ''))
@@ -240,7 +256,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     window=timedelta(seconds=link_window)
     ordered=[]
     for row in reversed(context):
-        if SETTLED.search(row.get('content') or ''):break
+        if settled(row.get('content')):break
         # Outgoing rows and other group members are never either half of a link.
         if linkable(source,row):ordered.append(row)
     def spent(i,row):

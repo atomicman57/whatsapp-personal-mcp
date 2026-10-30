@@ -10,7 +10,7 @@ import requests
 from transfer_detection import (classify,amount_clues,safe_context,TEST_PREFIX,has_bank,normalise_banks,
     parse_excluded_chat_phrases,parse_link_window,DEFAULT_EXCLUDED_CHAT_PHRASES,excluded,linked_amount,account_clues,bare_amount)
 from transfer_detection import digest
-from transfer_detector import Detector,State,Webhook,status_server,bounded_notification
+from transfer_detector import Detector,State,Webhook,status_server,bounded_notification,CLAIM_LEASE_SECONDS,WEBHOOK_TIMEOUT
 from transfer_detector_status import get_transfer_detection_status
 
 NOW=datetime.now(timezone.utc)
@@ -660,12 +660,37 @@ class RuntimeTests(unittest.TestCase):
         self.hook.fail=False;self.assertTrue(self.detector.deliver_one())
         self.assertEqual([x[0] for x in self.hook.calls],[key,key])
         self.assertEqual(self.state.status()['queued_notifications'],0)
-        # A claim stranded by a crash mid-send is released on restart rather than blocking the outbox.
+    def test_live_claim_survives_new_state_and_stale_claim_is_resent_once(self):
+        self.assertGreater(CLAIM_LEASE_SECONDS,sum(WEBHOOK_TIMEOUT))
+        self.add(message());self.detector.drain();key=self.state.due()[0]
+        sent=[];claimed=threading.Event();release=threading.Event()
+        class Blocking:
+            def send(self,key,payload):
+                sent.append(key);claimed.set();release.wait(5);return True,None
+        # Worker A claims and blocks mid-send; a new State (MCP tool, CLI, second process) must not free its claim.
+        worker=threading.Thread(target=Detector(self.state,self.bridge,Blocking(),'synthetic-instance','15550000001').deliver_one)
+        worker.start();self.assertTrue(claimed.wait(5))
+        other=State(self.directory.name);self.assertIsNone(other.due());self.assertIsNone(other.attempt_started(key))
+        self.assertFalse(Detector(other,self.bridge,Blocking(),'synthetic-instance','15550000001').deliver_one())
+        release.set();worker.join(5)
+        self.assertEqual(sent,[key]);self.assertEqual(self.state.status()['queued_notifications'],0)
+        # A claim stranded by a crash mid-send becomes due again once older than the lease, and is resent once.
         self.add(message(2,'Please send NGN 9,000 for paint. Bank: Demo Bank. Account 0123456780.',id='message-2'))
         self.detector.drain();key=self.state.due()[0]
-        self.assertTrue(self.state.attempt_started(key));self.assertIsNone(self.state.due())
+        self.assertTrue(self.state.attempt_started(key));self.assertIsNone(State(self.directory.name).due())
+        stale=(datetime.now(timezone.utc)-timedelta(seconds=CLAIM_LEASE_SECONDS+5)).isoformat()
+        with self.state.db() as db:db.execute('UPDATE outbox SET first_attempt=? WHERE id=?',(stale,key))
         restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
-        self.assertTrue(restarted.deliver_one());self.assertEqual(self.hook.calls[-1][0],key)
+        self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
+        self.assertEqual([x[0] for x in self.hook.calls],[key])
+        # A worker whose stale claim was taken over does not release the new holder's claim on failure.
+        self.add(message(3,'Please send NGN 7,000 for tiles. Bank: Demo Bank. Account 0123456781.',id='message-3'))
+        self.detector.drain();key=self.state.due()[0];self.state.attempt_started(key)
+        with self.state.db() as db:db.execute('UPDATE outbox SET first_attempt=? WHERE id=?',(stale,key))
+        current=self.state.attempt_started(key);self.assertTrue(current)
+        self.state.failed(key,0,'webhook_network_error',stale)
+        with self.state.db() as db:
+            self.assertEqual(db.execute('SELECT first_attempt,attempts FROM outbox WHERE id=?',(key,)).fetchone(),(current,0))
     def test_card_cancelled_after_due_is_not_sent(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()

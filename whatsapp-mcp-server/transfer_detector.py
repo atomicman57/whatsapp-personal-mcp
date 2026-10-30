@@ -19,7 +19,14 @@ from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECOND
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
 
+WEBHOOK_TIMEOUT=(5,20)  # connect, read seconds; used by Webhook.send
+# An outbox claim older than this is treated as abandoned (crash mid-send) and may be reclaimed.
+# It must exceed the longest send (WEBHOOK_TIMEOUT) with margin so a live send is never reclaimed.
+CLAIM_LEASE_SECONDS=120
+assert CLAIM_LEASE_SECONDS>sum(WEBHOOK_TIMEOUT)*2
+
 def utcnow():return datetime.now(timezone.utc).isoformat()
+def claim_cutoff():return (datetime.now(timezone.utc)-timedelta(seconds=CLAIM_LEASE_SECONDS)).isoformat()
 def parsed_time(value):
     result=datetime.fromisoformat(value.replace('Z','+00:00'))
     if result.tzinfo is None:raise ValueError('timezone required')
@@ -65,8 +72,8 @@ class State:
             columns={x[1] for x in db.execute('PRAGMA table_info(outbox)')}
             if 'request_key' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN request_key TEXT')
             if 'held' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0')
-            # A claim left by a crash mid-send (or a pre-exclusive-claim database) is released for retry.
-            db.execute('UPDATE outbox SET first_attempt=NULL WHERE delivered IS NULL')
+            # Claims are not cleared here: another worker may be mid-send. A claim stranded by a crash
+            # becomes due again once older than CLAIM_LEASE_SECONDS (see due/attempt_started).
     @contextmanager
     def db(self):
         connection=sqlite3.connect(self.path,timeout=10)
@@ -116,7 +123,8 @@ class State:
         return len(stale)
     def due(self):
         with self.lock,self.db() as db:
-            row=db.execute('SELECT id,payload,attempts FROM outbox WHERE delivered IS NULL AND first_attempt IS NULL AND next_attempt<=? ORDER BY rowid LIMIT 1',(time.time(),)).fetchone()
+            row=db.execute('SELECT id,payload,attempts FROM outbox WHERE delivered IS NULL AND (first_attempt IS NULL OR first_attempt<?) AND next_attempt<=? ORDER BY rowid LIMIT 1',
+                           (claim_cutoff(),time.time())).fetchone()
         return (row[0],json.loads(row[1]),row[2]) if row else None
     def delivered(self,key):
         with self.lock,self.db() as db:
@@ -124,20 +132,23 @@ class State:
             db.execute('UPDATE outbox SET payload=NULL,delivered=? WHERE id=?',(utcnow(),key))
         self.set(last_webhook_accepted=utcnow(),delivery_error=None)
     def attempt_started(self,key):
-        """Exclusively claim a due row; False if another worker claimed it or it was delivered or cancelled since `due()`."""
+        """Exclusively claim a due row (unclaimed, or claim older than the lease); returns the claim
+        timestamp, or None if another worker holds a live claim or it was delivered or cancelled since `due()`."""
+        claim=utcnow()
         with self.lock,self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            return db.execute('UPDATE outbox SET first_attempt=? WHERE id=? AND delivered IS NULL AND first_attempt IS NULL',
-                              (utcnow(),key)).rowcount==1
+            claimed=db.execute('UPDATE outbox SET first_attempt=? WHERE id=? AND delivered IS NULL AND (first_attempt IS NULL OR first_attempt<?)',
+                               (claim,key,claim_cutoff())).rowcount==1
+        return claim if claimed else None
     def enqueue_system(self,payload):
         with self.lock,self.db() as db:
             db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created) VALUES(?,?,?,?)',
                        (payload['event_id'],'system',json.dumps(payload),utcnow()))
-    def failed(self,key,attempts,code):
+    def failed(self,key,attempts,code,claim):
         with self.lock,self.db() as db:
-            # Release the claim so the backoff retry can reclaim it.
-            db.execute('UPDATE outbox SET attempts=?,next_attempt=?,first_attempt=NULL WHERE id=?',
-                       (attempts+1,time.time()+min(300,2**min(attempts+1,9)),key))
+            # Release our claim so the backoff retry can reclaim it; a no-op if another worker reclaimed it.
+            db.execute('UPDATE outbox SET attempts=?,next_attempt=?,first_attempt=NULL WHERE id=? AND first_attempt=?',
+                       (attempts+1,time.time()+min(300,2**min(attempts+1,9)),key,claim))
         self.set(delivery_error=code)
     def status(self):
         with self.lock,self.db() as db:
@@ -193,7 +204,7 @@ class Webhook:
         try:
             body=json.dumps(payload,ensure_ascii=False,separators=(',',':')).encode()
             response=requests.post(self.url,data=body,headers={**self.headers,'Content-Type':'application/json','Idempotency-Key':event_id},
-                                   timeout=(5,20),allow_redirects=False)
+                                   timeout=WEBHOOK_TIMEOUT,allow_redirects=False)
             # Acceptance is not evidence that the receiving bot has processed it.
             if 200<=response.status_code<300:return True,None
             return False,'webhook_http_'+str(response.status_code)
@@ -311,10 +322,11 @@ class Detector:
         item=self.state.due()
         if not item:return False
         key,payload,attempts=item
-        if not self.state.attempt_started(key):return True
+        claim=self.state.attempt_started(key)
+        if not claim:return True
         success,code=self.webhook.send(key,payload)
         if success:self.state.delivered(key)
-        else:self.state.failed(key,attempts,code)
+        else:self.state.failed(key,attempts,code,claim)
         return True
     def delivery_loop(self):
         while not self.stop.is_set():

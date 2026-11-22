@@ -17,7 +17,7 @@ import requests
 from transfer_telemetry import migrate, milliseconds, record, report, is_test_event
 from transfer_card import card_for, NameEnquiry
 from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
-    parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,settled,source_digest)
+    parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,settled,source_digest,request_language)
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
 
@@ -151,6 +151,15 @@ class State:
             return {row['id'] for row in rows if
                     db.execute('SELECT 1 FROM message_requests WHERE source=?',(digest(account,chat,row['id']),)).fetchone() or
                     db.execute('SELECT 1 FROM seen WHERE source=?',(digest(account,chat,row['id']),)).fetchone()}
+    def prior_requests(self,chat,request_key):
+        """Local intake history only. It never decides whether a candidate emits."""
+        with self.lock,self.db() as db:
+            rows=db.execute('''SELECT r.request_key,r.active,
+                (SELECT min(o.created) FROM outbox o WHERE o.request_key=r.request_key)
+                FROM requests_latest r WHERE r.chat_jid=? AND r.request_key!=?
+                ORDER BY r.rowid DESC LIMIT 4''',(chat,request_key)).fetchall()
+        return ([{'request_key':key,'status':'open' if active else 'inactive','at':at}
+                 for key,active,at in rows[:3]],len(rows)>3)
     def _queue(self,db,source,payload):
         test_event=int(is_test_event(payload))
         payload=bounded_notification(payload)
@@ -409,9 +418,20 @@ class Detector:
         if not clues:return skip()
         request_key=digest(self.account,row['chat_jid'],clues['anchor_message_id'])
         with self.state.lock,self.state.db() as db:
-            latest=db.execute('SELECT card,amounts FROM requests_latest WHERE request_key=? AND active=1',
+            latest=db.execute('SELECT card,amounts,active FROM requests_latest WHERE request_key=?',
                               (request_key,)).fetchone()
         old_card=json.loads(latest[0]) if latest and latest[0] else {}
+        if clues['anchor_message_id']!=row['id']:
+            anchor=next((x for x in rows if x['id']==clues['anchor_message_id']),None)
+            expired=not anchor or (timestamp-parsed_time(anchor['timestamp'])).total_seconds()>self.link_window
+            if expired or (latest and not latest[2]) or (request_language(row.get('content','')) and old_card.get('amount') is not None):
+                # A complete request is not an empty amount slot. Closed/expired
+                # conversations cannot supply a destination or an amount.
+                clues=classify(row,(),dry_run,self.link_window,self.exclusions)
+                if not clues:return skip()
+                request_key=digest(self.account,row['chat_jid'],row['id'])
+                latest=None;old_card={}
+        prior_requests,prior_truncated=self.state.prior_requests(row['chat_jid'],request_key)
         if 'standalone_amount_follow_up' in clues['reasons']:
             if (not old_card or old_card.get('amount') is not None or
                     clues['account_number_candidates']!=[old_card.get('account_number')]):return skip()
@@ -431,7 +451,8 @@ class Detector:
             card['account_name_reason']='pending_nonblocking' if card['account_number'] and card['bank'] else 'destination_missing_or_ambiguous'
         return source_key,body_hash,timed({**base,'event_type':'transfer_request_candidate','candidate':clues,
             'card':card,'requester_is_saved_contact':card['requester_is_saved_contact'],
-            'request_key':request_key,
+            'request_key':request_key,'prior_requests':prior_requests,
+            'prior_requests_truncated':prior_truncated,'prior_requests_status_source':'local_detector',
             'context':cleaned,'context_truncated':truncated or len(row.get('content',''))>2000,
             'context_may_be_incomplete':len(context)>=50 or not any(x['id']==row['id'] for x in rows),
             'dry_run':dry_run,'previous_event_id':prior[1] if prior else None})

@@ -22,7 +22,7 @@ UNSETTLED = re.compile(r"\b(?:if|when|until|once|unless|not)\b|n['’]t\b",re.I)
 RECEIPT = re.compile(SETTLED.pattern+r"|\b(?:send (?:me )?(?:the )?receipt|proof of payment|transaction reference)\b",re.I)
 ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|assist|help me|i need|we need|balance|settle|deposit|owe)\b',re.I)
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
-BANK = re.compile(r'\b(?:bank|acct|account(?: number)?|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
+BANK = re.compile(r'\b(?:bank|acct|account(?: number)?|uba|gtbank|gtb|gtco|gt|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
 AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million|naira)\b',re.I)
 FX_AMOUNT = re.compile(r'(USD|EUR|GBP|\$|€|£)\s*(\d[\d,]*(?:\.\d{1,2})?)',re.I)
 IMPLICIT = re.compile(r'\b(?:gas|fuel|rent|school fees|electricity bill)\b.{0,50}\b(?:finish(?:ed)?|due|expired|renew)\b',re.I)
@@ -56,7 +56,8 @@ def bank_name_candidates(*texts):
         for match in BANK.finditer(normalise_banks(text)):
             token=' '.join(match.group(0).split())
             if token.casefold() in GENERIC_BANK_TOKENS:continue
-            names.append(token.upper() if token.upper() in BANK_ACRONYMS else token.title())
+            names.append('GTBank' if token.casefold() in {'gt','gtb','gtbank','gtco','guaranty trust'} else
+                         token.upper() if token.upper() in BANK_ACRONYMS else token.title())
     return list(dict.fromkeys(names))[:5]
 
 def parse_excluded_chat_phrases(value):
@@ -370,7 +371,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         accounts=previous_accounts;account_source=previous['id']
         if anchor==source.get('id'):anchor=previous['id']
     reasons=['standalone_amount_follow_up'] if standalone_follow_up else []
-    if accounts and (has_bank(text) or previous or any(has_bank(x.get('content','')) for x in prior[:3])):reasons.append('payment_details_with_context')
+    if accounts:reasons.append('payment_details_with_context' if has_bank(text) or previous or any(has_bank(x.get('content','')) for x in prior[:3]) else 'account_number_supplied')
     if direct:reasons.append('request_language_with_money_or_amount')
     if IMPLICIT.search(text):reasons.append('possible_bill_or_supply_request')
     if follow_up:reasons.append('amount_follow_up')

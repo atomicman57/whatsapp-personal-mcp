@@ -311,3 +311,34 @@ A missing owner stage is not a rollback trigger. Webhook acceptance alone does
 not establish card creation or owner delivery. Any later live synthetic test
 requires separate WhatsApp-send authorization; do not run `e2e_latency.py --send`
 as part of preparing or reviewing this PR.
+
+
+## New messages and earlier requests
+
+Every new inbound request or supplied account number emits a candidate immediately,
+including a bare account with no bank or amount. `Gt`, `GTB`, `gtbank`, `GTCO` and
+`Guaranty Trust` normalize to `GTBank`. A missing amount stays null with
+`candidate.amount_missing=true`; the owner alert renders "amount not given".
+The detector never uses matching account digits, amount or chat as a dedupe key.
+Only the same source message is deduped. Edits to that source retain the existing
+invalidation/revision behavior.
+
+An account resent in a new message starts a new request. A fresh explicit request
+after an already complete request also starts a new request without inheriting
+its destination or amount. Normal clarifications may revise an open request
+within the configured short link window, and each revision emits a webhook.
+Consumed amount fragments remain unavailable to a different request.
+
+Candidate payloads include `prior_requests` with up to three earlier requests
+from the same chat, each containing `request_key`, `status` and `at`.
+`prior_requests_truncated` indicates more history. `at` is the earliest retained
+outbox creation timestamp, or null for legacy state with no retained row.
+`prior_requests_status_source=local_detector` means `open`/`inactive` reflect the
+local active flag, not payment execution or Transfer Request Bot's handled status.
+An inactive request may have been withdrawn or settled. The intake helper's
+`related_requests` supplies its own recorded states, including handled/completed,
+as context when available. Neither history field suppresses a new candidate.
+These fields contain no message text or account numbers.
+
+This change requires no cursor reset, migration, outbox retry or historical
+replay. Keep all existing state and credentials when deploying a reviewed image.

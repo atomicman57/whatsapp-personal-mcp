@@ -49,7 +49,7 @@ func alertFixture(t *testing.T) (*intakeAlerts, *[]string) {
 			return id, nil
 		}, remove: func(_ context.Context, _ types.JID, id string, _ time.Time) (string, error) {
 			calls = append(calls, "delete:"+id)
-			return "everyone", nil
+			return "revoke+delete_for_me", nil
 		}}
 	return a, &calls
 }
@@ -109,7 +109,7 @@ func TestIntakeIdempotencyAndRevision(t *testing.T) {
 	if strings.Join(*calls, ",") != "send,delete:message-0,send" {
 		t.Fatal(*calls)
 	}
-	if len(rows) != 2 || rows[0].DeletedAt == "" || rows[0].DeleteMode != "everyone" || rows[1].Status != "sent" {
+	if len(rows) != 2 || rows[0].DeletedAt == "" || rows[0].DeleteMode != "revoke+delete_for_me" || rows[1].Status != "sent" {
 		t.Fatal(rows)
 	}
 	if _, err = a.create(ctx, alertInput("event-delayed", 1)); err != nil {
@@ -289,7 +289,13 @@ func TestIntakeRevokeAndFallback(t *testing.T) {
 			apply := func(_ context.Context, p appstate.PatchInfo) error {
 				patches++
 				m := p.Mutations[0]
-				if strings.Join(m.Index, ",") != "deleteMessageForMe,"+alertSelf+",original,1,0" || m.Value.GetDeleteMessageForMeAction().GetMessageTimestamp() != 1000 {
+				wantID := "original"
+				wantTimestamp := int64(1000)
+				if patches == 2 {
+					wantID = "revoke"
+					wantTimestamp = time.Now().Unix()
+				}
+				if p.Type != appstate.WAPatchRegularHigh || m.Version != 3 || len(p.Mutations) != 1 || m.Value.GetDeleteMessageForMeAction().GetDeleteMedia() || strings.Join(m.Index, ",") != "deleteMessageForMe,"+alertSelf+","+wantID+",1,0" || m.Value.GetDeleteMessageForMeAction().GetMessageTimestamp() < wantTimestamp-1 || m.Value.GetDeleteMessageForMeAction().GetMessageTimestamp() > wantTimestamp+1 {
 					t.Fatal("invalid delete-for-me patch")
 				}
 				return nil
@@ -298,10 +304,10 @@ func TestIntakeRevokeAndFallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if fallback && (mode != "me" || patches != 1) {
+			if fallback && (mode != "delete_for_me_only" || patches != 1) {
 				t.Fatal(mode, patches)
 			}
-			if !fallback && (mode != "everyone" || patches != 0) {
+			if !fallback && (mode != "revoke+delete_for_me" || patches != 2) {
 				t.Fatal(mode, patches)
 			}
 		})
@@ -357,13 +363,13 @@ func TestIntakePartialDeleteReturnsAllResults(t *testing.T) {
 		if id == "message-0" {
 			return "", errors.New("synthetic failure")
 		}
-		return "me", nil
+		return "delete_for_me_only", nil
 	}
 	rows, err := a.delete(ctx, "event-two")
 	if err == nil || attempted != 2 || len(rows) != 2 {
 		t.Fatal("partial delete lost results", err, attempted)
 	}
-	if rows[0].Status != "delete_failed" || rows[1].DeleteMode != "me" || rows[1].Status != "deleted" {
+	if rows[0].Status != "delete_failed" || rows[1].DeleteMode != "delete_for_me_only" || rows[1].Status != "deleted" {
 		t.Fatal(rows)
 	}
 	if len(*calls) != 1 {
@@ -379,7 +385,7 @@ func TestIntakeFallbackFailureReported(t *testing.T) {
 	}
 	apply := func(context.Context, appstate.PatchInfo) error { return errors.New("synthetic patch failure") }
 	mode, err := deleteIntakeMessage(context.Background(), client, send, own, "original", time.Now(), apply)
-	if err == nil || mode != "" {
+	if err == nil || mode != "delete_for_me_only" {
 		t.Fatal("failed fallback reported success")
 	}
 }

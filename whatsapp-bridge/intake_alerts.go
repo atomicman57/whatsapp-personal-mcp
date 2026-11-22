@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ type intakeAlerts struct {
 	own    func() (types.JID, types.JID)
 	send   func(context.Context, types.JID, *waProto.Message, string) (string, error)
 	newID  func() string
+	apply  func(context.Context, appstate.PatchInfo) error
 	remove func(context.Context, types.JID, string, time.Time) (string, error)
 }
 
@@ -42,15 +44,19 @@ type intakeAlertInput struct {
 }
 
 type intakeAlertRow struct {
-	EventID    string `json:"event_id"`
-	RequestKey string `json:"request_key"`
-	Revision   int    `json:"revision"`
-	MessageID  string `json:"message_id"`
-	ChatJID    string `json:"chat_jid"`
-	SentAt     string `json:"sent_at"`
-	DeletedAt  string `json:"deleted_at"`
-	DeleteMode string `json:"delete_mode"`
-	Status     string `json:"status"`
+	EventID     string `json:"event_id"`
+	RequestKey  string `json:"request_key"`
+	Revision    int    `json:"revision"`
+	MessageID   string `json:"message_id"`
+	ChatJID     string `json:"chat_jid"`
+	SentAt      string `json:"sent_at"`
+	DeletedAt   string `json:"deleted_at"`
+	DeleteMode  string `json:"delete_mode"`
+	Status      string `json:"status"`
+	RevokeID    string `json:"revoke_message_id"`
+	RevokedAt   string `json:"revoked_at"`
+	CleanupAt   string `json:"cleanup_at"`
+	DeleteError string `json:"delete_error"`
 }
 
 var intakeID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
@@ -66,7 +72,37 @@ func migrateIntakeAlerts(db *sql.DB) error {
  CREATE INDEX IF NOT EXISTS intake_alert_request ON intake_alerts(request_key);
  CREATE TABLE IF NOT EXISTS intake_alert_closed (request_key TEXT PRIMARY KEY, revision INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS intake_alert_closed_events (event_id TEXT PRIMARY KEY);`)
-	return err
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	rows, err := db.Query("PRAGMA table_info(intake_alerts)")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, kind string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"revoke_message_id", "revoked_at", "cleanup_at", "delete_error"} {
+		if !columns[name] {
+			if _, err = db.Exec("ALTER TABLE intake_alerts ADD COLUMN " + name + " TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (a *intakeAlerts) self(target string) (types.JID, error) {
@@ -85,7 +121,7 @@ func (a *intakeAlerts) self(target string) (types.JID, error) {
 }
 
 func (a *intakeAlerts) rows(eventID string) ([]intakeAlertRow, error) {
-	rows, err := a.db.Query(`SELECT event_id,request_key,revision,message_id,chat_jid,sent_at,deleted_at,delete_mode,status
+	rows, err := a.db.Query(`SELECT event_id,request_key,revision,message_id,chat_jid,sent_at,deleted_at,delete_mode,status,revoke_message_id,revoked_at,cleanup_at,delete_error
  FROM intake_alerts WHERE request_key IN (SELECT request_key FROM intake_alerts WHERE event_id=?) ORDER BY revision`, eventID)
 	if err != nil {
 		return nil, err
@@ -94,7 +130,7 @@ func (a *intakeAlerts) rows(eventID string) ([]intakeAlertRow, error) {
 	result := []intakeAlertRow{}
 	for rows.Next() {
 		var r intakeAlertRow
-		if err = rows.Scan(&r.EventID, &r.RequestKey, &r.Revision, &r.MessageID, &r.ChatJID, &r.SentAt, &r.DeletedAt, &r.DeleteMode, &r.Status); err != nil {
+		if err = rows.Scan(&r.EventID, &r.RequestKey, &r.Revision, &r.MessageID, &r.ChatJID, &r.SentAt, &r.DeletedAt, &r.DeleteMode, &r.Status, &r.RevokeID, &r.RevokedAt, &r.CleanupAt, &r.DeleteError); err != nil {
 			return nil, err
 		}
 		result = append(result, r)
@@ -108,7 +144,7 @@ func (a *intakeAlerts) deleteRows(ctx context.Context, rows []intakeAlertRow) er
 		if row.MessageID == "" || row.DeletedAt != "" {
 			continue
 		}
-		jid, err := a.self(row.ChatJID)
+		jid, err := a.ledgerTarget(row.ChatJID, row.MessageID)
 		if err != nil {
 			return err
 		}
@@ -118,14 +154,14 @@ func (a *intakeAlerts) deleteRows(ctx context.Context, rows []intakeAlertRow) er
 		}
 		mode, err := a.remove(ctx, jid, row.MessageID, sent)
 		if err != nil {
-			_, updateErr := a.db.Exec(`UPDATE intake_alerts SET status='delete_failed' WHERE event_id=? AND revision=?`, row.EventID, row.Revision)
+			_, updateErr := a.db.Exec(`UPDATE intake_alerts SET status='delete_failed',delete_mode=?,delete_error=? WHERE event_id=? AND revision=?`, mode, err.Error(), row.EventID, row.Revision)
 			if updateErr != nil {
 				return updateErr
 			}
 			deletionErr = fmt.Errorf("alert deletion failed")
 			continue
 		}
-		_, err = a.db.Exec(`UPDATE intake_alerts SET deleted_at=?,delete_mode=?,status='deleted' WHERE event_id=? AND revision=?`, time.Now().UTC().Format(time.RFC3339Nano), mode, row.EventID, row.Revision)
+		_, err = a.db.Exec(`UPDATE intake_alerts SET deleted_at=?,cleanup_at=?,delete_mode=?,status='deleted' WHERE event_id=? AND revision=?`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), mode, row.EventID, row.Revision)
 		if err != nil {
 			return err
 		}
@@ -235,6 +271,7 @@ func (a *intakeAlerts) delete(ctx context.Context, eventID string) ([]intakeAler
 }
 
 func (a *intakeAlerts) routes(mux *http.ServeMux) {
+	a.cleanupRoute(mux)
 	mux.HandleFunc("/api/intake-alerts", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
@@ -303,18 +340,44 @@ func decodeIntake(w http.ResponseWriter, r *http.Request, target any) bool {
 	return true
 }
 
-func deleteIntakeMessage(ctx context.Context, client *whatsmeow.Client, send replySender, jid types.JID, id string, sent time.Time, apply func(context.Context, appstate.PatchInfo) error) (string, error) {
-	if _, err := send(ctx, jid, client.BuildRevoke(jid, types.EmptyJID, id)); err == nil {
-		return "everyone", nil
-	}
-	patch := appstate.PatchInfo{Type: appstate.WAPatchRegularHigh, Mutations: []appstate.MutationInfo{{
+func deleteForMePatch(jid types.JID, id string, sent time.Time) appstate.PatchInfo {
+	return appstate.PatchInfo{Type: appstate.WAPatchRegularHigh, Mutations: []appstate.MutationInfo{{
 		Index: []string{appstate.IndexDeleteMessageForMe, jid.String(), id, "1", "0"}, Version: 3,
 		Value: &waSyncAction.SyncActionValue{DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{DeleteMedia: proto.Bool(false), MessageTimestamp: proto.Int64(sent.Unix())}},
 	}}}
-	if err := apply(ctx, patch); err != nil {
-		return "", fmt.Errorf("delete for me failed")
+}
+
+// record persists the acknowledged revoke before app-state I/O so retries don't
+// create another revoke stanza. Errors are fixed codes, never transport payloads.
+func deleteIntakeMessage(ctx context.Context, client *whatsmeow.Client, send replySender, jid types.JID, id string, sent time.Time, apply func(context.Context, appstate.PatchInfo) error, record ...func(string, time.Time) error) (string, error) {
+	revokeID, revokeErr := send(ctx, jid, client.BuildRevoke(jid, types.EmptyJID, id))
+	mode := "delete_for_me_only"
+	revokedAt := time.Now().UTC()
+	if revokeErr == nil {
+		mode = "revoke+delete_for_me"
 	}
-	return "me", nil
+	if revokeErr != nil {
+		revokeID = ""
+		revokedAt = time.Time{}
+	}
+	for _, save := range record {
+		if err := save(revokeID, revokedAt); err != nil {
+			return mode, err
+		}
+	}
+	var cleanupErr error
+	if err := apply(ctx, deleteForMePatch(jid, id, sent)); err != nil {
+		cleanupErr = errors.New("delete_for_me_original_failed")
+	}
+	if revokeErr == nil && revokeID != "" && revokeID != id {
+		if err := apply(ctx, deleteForMePatch(jid, revokeID, revokedAt)); err != nil {
+			cleanupErr = errors.Join(cleanupErr, errors.New("delete_for_me_revoke_failed"))
+		}
+	}
+	if cleanupErr != nil && revokeErr != nil {
+		cleanupErr = errors.Join(errors.New("revoke_failed"), cleanupErr)
+	}
+	return mode, cleanupErr
 }
 
 func registerIntakeAlerts(mux *http.ServeMux, client *whatsmeow.Client, s *MessageStore) error {
@@ -328,7 +391,8 @@ func registerIntakeAlerts(mux *http.ServeMux, client *whatsmeow.Client, s *Messa
 		response, err := client.SendMessage(ctx, jid, msg)
 		return response.ID, err
 	}
-	a := &intakeAlerts{db: s.db, own: func() (types.JID, types.JID) {
+	var a *intakeAlerts
+	a = &intakeAlerts{db: s.db, apply: client.SendAppState, own: func() (types.JID, types.JID) {
 		if client.Store.ID == nil {
 			return types.EmptyJID, types.EmptyJID
 		}
@@ -340,8 +404,36 @@ func registerIntakeAlerts(mux *http.ServeMux, client *whatsmeow.Client, s *Messa
 		response, err := client.SendMessage(ctx, jid, msg, whatsmeow.SendRequestExtra{ID: id})
 		return response.ID, err
 	}, remove: func(ctx context.Context, jid types.JID, id string, sent time.Time) (string, error) {
-		return deleteIntakeMessage(ctx, client, send, jid, id, sent, client.SendAppState)
+		return a.removeWithClient(ctx, client, send, jid, id, sent)
 	}}
 	a.routes(mux)
 	return nil
+}
+
+func (a *intakeAlerts) removeWithClient(ctx context.Context, client *whatsmeow.Client, send replySender, jid types.JID, id string, sent time.Time) (string, error) {
+	if _, err := a.ledgerTarget(jid.String(), id); err != nil {
+		return "", err
+	}
+	// Only IDs associated with this ledger row may reach SendAppState.
+	var revokedAt string
+	if err := a.db.QueryRow(`SELECT revoked_at FROM intake_alerts WHERE chat_jid=? AND message_id=?`, jid.String(), id).Scan(&revokedAt); err != nil {
+		return "", err
+	}
+	if revokedAt != "" {
+		err := a.cleanupMessage(ctx, jid.String(), id, sent)
+		if err == nil {
+			_, err = a.db.Exec(`UPDATE intake_alerts SET delete_error='' WHERE chat_jid=? AND message_id=?`, jid.String(), id)
+		}
+		return "revoke+delete_for_me", err
+	}
+	return deleteIntakeMessage(ctx, client, send, jid, id, sent, a.applyGuarded, func(revokeID string, at time.Time) error {
+		errorCode, timestamp := "", ""
+		if at.IsZero() {
+			errorCode = "revoke_failed"
+		} else {
+			timestamp = at.Format(time.RFC3339Nano)
+		}
+		_, err := a.db.Exec(`UPDATE intake_alerts SET revoke_message_id=?,revoked_at=?,delete_error=? WHERE chat_jid=? AND message_id=?`, revokeID, timestamp, errorCode, jid.String(), id)
+		return err
+	})
 }

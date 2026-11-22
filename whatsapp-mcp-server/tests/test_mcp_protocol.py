@@ -73,7 +73,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                         await session.initialize()
                         tools = await session.list_tools()
                         self.assertGreaterEqual(len(tools.tools), 30)
-                        self.assertTrue({'delete_intake_alert', 'list_intake_alerts'} <= {tool.name for tool in tools.tools})
+                        self.assertTrue({'delete_intake_alert', 'list_intake_alerts', 'cleanup_intake_alert_tombstones'} <= {tool.name for tool in tools.tools})
                         for tool in tools.tools:
                             self.assertNotIn("confirmation_token", tool.inputSchema.get("properties", {}))
 

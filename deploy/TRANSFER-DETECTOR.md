@@ -132,12 +132,21 @@ are included.
 `stages(event_id, stage, at)` is append-only with SQLite update/delete guards.
 Owner-authenticated MCP tools are available through existing OAuth transports:
 
-- record_intake_stage(event_id, stage): append intake_received, card_created or
-  owner_alerted only after that action completes. Time comes from the server;
-  no caller timestamp or free text is accepted. Use the revision's own event ID.
+- record_intake_stage(event_id, stage, observed_at=None): append intake_received,
+  card_created or owner_alerted only after that action completes. Existing calls
+  default to server time. A late call can supply UTC ISO-8601 with Z or +00:00, or
+  numeric epoch milliseconds. The time must be at or after the event msg_ts and
+  no more than five seconds ahead of server time. Invalid times append nothing.
+  No free text is accepted. Use the revision's own event ID.
 - get_transfer_latency_report(days=14): per-hop count, median, nearest-rank p90,
   max and event IDs above 5,000 ms, plus overdue events awaiting owner stages.
   days accepts integers 1–90. Earliest duplicate stage timestamps are used.
+  Test/dry-run events leave awaiting_owner_stage only when their message age is
+  greater than ten minutes. Other hop statistics remain unchanged. A content-free
+  test marker survives delivery and restart. Migration backfills retained payloads;
+  previously delivered rows with erased payloads cannot be identified retroactively.
+  Test markers include dry_run, test, is_test or test_flagged boolean flags on the
+  payload/source, and a TRANSFER_DETECTOR_TEST event type or source-content prefix.
 
 Hops cover message-to-ingest, ingest-to-SSE, SSE-to-observe, ingest-to-observe,
 observe-to-POST, classification and HTTP time, POST-to-intake, intake-to-card,

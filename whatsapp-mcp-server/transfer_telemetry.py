@@ -1,4 +1,5 @@
 """Content-free, millisecond intake measurements. Unknown hops remain unknown."""
+import json
 import math
 import time
 import sqlite3
@@ -7,7 +8,8 @@ from datetime import datetime, timezone
 STAGES = ('intake_received', 'card_created', 'owner_alerted')
 COLUMNS = {'msg_ts': 'INTEGER', 'ingested_at': 'INTEGER', 'sse_wake_at': 'INTEGER',
            'observed_at': 'INTEGER', 'classify_ms': 'REAL', 'post_started_at': 'INTEGER',
-           'http_status': 'INTEGER', 'http_ms': 'REAL', 'delivered_at': 'INTEGER'}
+           'http_status': 'INTEGER', 'http_ms': 'REAL', 'delivered_at': 'INTEGER',
+           'test_event': 'INTEGER NOT NULL DEFAULT 0'}
 
 
 def milliseconds(value=None):
@@ -21,11 +23,46 @@ def milliseconds(value=None):
         return None
 
 
+def stage_time(observed_at=None):
+    now = milliseconds()
+    if observed_at is None:
+        return now
+    try:
+        if type(observed_at) in (int, float):
+            if not math.isfinite(observed_at):
+                raise ValueError()
+            at = int(observed_at)
+        elif isinstance(observed_at, str):
+            parsed = datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
+            if parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 0:
+                raise ValueError()
+            at = int(parsed.timestamp() * 1000)
+        else:
+            raise ValueError()
+        if at < 0 or at > now + 5000:
+            raise ValueError()
+        return at
+    except (ValueError, TypeError, OverflowError, OSError):
+        raise ValueError('invalid_observed_at') from None
+
+
+def is_test_event(payload):
+    source = payload.get('source') or {}
+    return (any(payload.get(key) is True or source.get(key) is True
+                for key in ('dry_run', 'test', 'is_test', 'test_flagged'))
+            or str(payload.get('event_type', '')).startswith('TRANSFER_DETECTOR_TEST')
+            or str(source.get('content', '')).startswith('TRANSFER_DETECTOR_TEST'))
+
+
 def migrate(db):
     columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
     for name, kind in COLUMNS.items():
         if name not in columns:
             db.execute(f'ALTER TABLE outbox ADD COLUMN {name} {kind}')
+    if 'test_event' not in columns:
+        for event_id, body in db.execute('SELECT id,payload FROM outbox WHERE payload IS NOT NULL'):
+            if is_test_event(json.loads(body)):
+                db.execute('UPDATE outbox SET test_event=1 WHERE id=?', (event_id,))
     db.executescript('''CREATE TABLE IF NOT EXISTS stages(event_id TEXT NOT NULL, stage TEXT NOT NULL, at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS stages_event ON stages(event_id);
         CREATE TRIGGER IF NOT EXISTS stages_no_update BEFORE UPDATE ON stages BEGIN SELECT RAISE(ABORT,'append_only'); END;
@@ -34,13 +71,16 @@ def migrate(db):
     db.execute('UPDATE outbox SET held=0,next_attempt=0 WHERE held=1 AND delivered IS NULL')
 
 
-def record(state, event_id, stage):
+def record(state, event_id, stage, observed_at=None):
     if not isinstance(event_id, str) or not 0 < len(event_id) <= 128 or stage not in STAGES:
         raise ValueError('invalid_intake_stage')
     with state.lock, state.db() as db:
-        if not db.execute('SELECT 1 FROM outbox WHERE id=?', (event_id,)).fetchone():
+        row = db.execute('SELECT msg_ts FROM outbox WHERE id=?', (event_id,)).fetchone()
+        if row is None:
             raise ValueError('unknown_event')
-        at = milliseconds()
+        at = stage_time(observed_at)
+        if row[0] is not None and at < row[0]:
+            raise ValueError('invalid_observed_at')
         db.execute('INSERT INTO stages VALUES(?,?,?)', (event_id, stage, at))
     return {'event_id': event_id, 'stage': stage, 'at': at}
 
@@ -80,7 +120,7 @@ def report(state, days=14):
         end = values.get('owner_card_at')
         if start is not None and end is not None and end-start > 5000:
             slow.append(row['id'])
-        if start is not None and end is None:
+        if start is not None and end is None and not (values.get('test_event') and now-start > 600000):
             incomplete.append({'event_id': row['id'], 'age_ms': max(0, now-start), 'over_5s': now-start > 5000})
     result = {}
     for name, points in hops.items():

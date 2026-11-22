@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_telemetry import migrate, milliseconds, record, report
+from transfer_telemetry import migrate, milliseconds, record, report, is_test_event
 from transfer_card import card_for, NameEnquiry
 from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
     parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,settled,source_digest)
@@ -130,13 +130,14 @@ class State:
         with self.lock,self.db() as db:
             return db.execute('SELECT digest,event FROM seen WHERE source=?',(source,)).fetchone()
     def _queue(self,db,source,payload):
+        test_event=int(is_test_event(payload))
         payload=bounded_notification(payload)
         if db.execute('SELECT count(*) FROM outbox WHERE delivered IS NULL').fetchone()[0]>=10000:
             raise RuntimeError('outbox_capacity')
-        db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms,request_key,held,next_attempt,msg_ts,ingested_at,sse_wake_at,observed_at,classify_ms) VALUES(?,?,?,?,?,?,?,0,0,?,?,?,?,?)',
+        db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms,request_key,held,next_attempt,msg_ts,ingested_at,sse_wake_at,observed_at,classify_ms,test_event) VALUES(?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)',
             (payload['event_id'],source,json.dumps(payload),utcnow(),payload.get('detector_observed_at'),payload.get('detector_processing_ms'),payload.get('request_key'),
              milliseconds(payload.get('source',{}).get('timestamp')) if payload.get('source',{}).get('timestamp') else None,
-             payload.get('ingested_at'),payload.get('sse_wake_at'),milliseconds(payload.get('detector_observed_at')) if payload.get('detector_observed_at') else None,payload.get('detector_processing_ms')))
+             payload.get('ingested_at'),payload.get('sse_wake_at'),milliseconds(payload.get('detector_observed_at')) if payload.get('detector_observed_at') else None,payload.get('detector_processing_ms'),test_event))
         if self.events is not None:self.events.publish(db,payload,0)
         return payload
     def consume(self,sequence,source,body_digest,payload,hold_until=0):
@@ -467,8 +468,9 @@ def status_server(state,token,port=8755):
                 length=int(self.headers.get('Content-Length','0'))
                 if not 0<length<=1024:raise ValueError()
                 value=json.loads(self.rfile.read(length))
-                if not isinstance(value,dict) or set(value)!={'event_id','stage'}:raise ValueError()
-                self.answer(record(state,value['event_id'],value['stage']))
+                if (not isinstance(value,dict) or not {'event_id','stage'} <= set(value)
+                        or set(value) - {'event_id','stage','observed_at'}):raise ValueError()
+                self.answer(record(state,value['event_id'],value['stage'],value.get('observed_at')))
             except (ValueError,TypeError):self.send_error(400)
     server=ThreadingHTTPServer(('127.0.0.1',port),Handler)
     threading.Thread(target=server.serve_forever,daemon=True).start()

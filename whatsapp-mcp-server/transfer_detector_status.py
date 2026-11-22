@@ -38,16 +38,24 @@ def _owner_intake(path, payload=None):
         return {'success': False, 'code': 'detector_intake_unavailable'}
 
 
-def record_intake_stage(event_id: str, stage: str) -> dict:
+def record_intake_stage(event_id: str, stage: str, observed_at: str | int | float | None = None) -> dict:
     """Owner-only append-only timestamp. Stages: intake_received, card_created, owner_alerted.
 
     Record card_created only after upserting the owner card by request_key. This is
-    telemetry, never payment approval. No text, account numbers or timestamps accepted.
+    telemetry, never payment approval. observed_at accepts UTC ISO-8601 or epoch
+    milliseconds, defaults to now, and allows up to five seconds of future skew.
+    It cannot precede the event message time. No text or account numbers accepted.
     """
-    from transfer_telemetry import STAGES
+    from transfer_telemetry import STAGES, stage_time
     if not isinstance(event_id, str) or not 0 < len(event_id) <= 128 or stage not in STAGES:
         return {'success': False, 'code': 'invalid_intake_stage'}
-    return _owner_intake('stages', {'event_id': event_id, 'stage': stage})
+    payload = {'event_id': event_id, 'stage': stage}
+    if observed_at is not None:
+        try:
+            payload['observed_at'] = stage_time(observed_at)
+        except ValueError:
+            return {'success': False, 'code': 'invalid_observed_at'}
+    return _owner_intake('stages', payload)
 
 
 def get_transfer_latency_report(days: int = 14) -> dict:

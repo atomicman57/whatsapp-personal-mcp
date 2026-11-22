@@ -108,6 +108,121 @@ class ReplayTests(unittest.TestCase):
             self.events=[json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox ORDER BY rowid')]
         return self.events
 
+    def test_label_numbers_never_supply_amount_alone_or_with_account(self):
+        labels=('retest 5','test 8','item 2','no 3','#4','number 2500','arbitrary 2500',
+                'Please send 2500','2500 for parts','retest 2500')
+        for index,label in enumerate(labels):
+            with self.subTest(case=index):
+                chat=f'label-{index}@lid'
+                self.feed('Please send to '+WEMA+' Wema Demo '+label,chat=chat)
+                self.assertIsNone(self.amount(self.events[-1]))
+                before=list(self.events)
+                self.feed(label,12,chat=chat)
+                self.assertEqual(self.events,before)
+                self.feed(label,13,chat=f'isolated-{index}@lid')
+                self.assertEqual(self.events,before)
+
+    def test_standalone_amount_formats_update_empty_key_revision_two(self):
+        for index,text in enumerate(('2500','2,500','₦2500','N2500','2500 naira',
+                                     'For parts\n2500','For parts\n2,500','For parts\n₦2500')):
+            with self.subTest(case=index):
+                chat=f'format-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=self.events[-1]
+                self.feed(text,900,chat=chat)
+                self.assert_update(before,self.events[-1],'2500')
+                self.assertIn('amount',self.events[-1]['changed_fields'])
+
+    def test_standalone_amount_formats_require_immediate_same_chat_account(self):
+        for index,text in enumerate(('2500','2,500','₦2500','N2500','2500 naira','For parts\n2500')):
+            with self.subTest(case=index):
+                chat=f'context-{index}@lid'
+                self.feed('Please send money',chat=chat)
+                before=list(self.events)
+                self.feed(text,12,chat=chat)
+                self.assertEqual(self.events,before)
+                self.feed(WEMA+' Wema',20,chat=chat)
+                before=list(self.events)
+                self.feed(text,21,chat=f'other-format-{index}@lid')
+                self.assertEqual(self.events,before)
+                self.feed('How is the weather?',22,chat=chat)
+                before=list(self.events)
+                self.feed(text,23,chat=chat)
+                self.assertEqual(self.events,before)
+
+    def test_standalone_amount_formats_do_not_replace_completed_or_inactive_key(self):
+        for index,text in enumerate(('2500','2,500','₦2500','N2500','2500 naira','For parts\n2500')):
+            for active in (True,False):
+                with self.subTest(case=index,active=active):
+                    chat=f'key-{index}-{active}@lid'
+                    self.feed(WEMA+' Wema'+(' 4k' if active else ''),chat=chat)
+                    if not active:
+                        with self.state.db() as db:
+                            db.execute('UPDATE requests_latest SET active=0 WHERE chat_jid=?',(chat,))
+                    before=list(self.events)
+                    self.feed(text,12,chat=chat)
+                    self.assertEqual(self.events,before)
+
+    def test_standalone_amount_formats_expire_after_900_seconds(self):
+        for index,text in enumerate(('2500','2,500','₦2500','N2500','2500 naira','For parts\n2500')):
+            with self.subTest(case=index):
+                chat=f'expired-format-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=list(self.events)
+                self.feed(text,901,chat=chat)
+                self.assertEqual(self.events,before)
+
+    def test_standalone_amount_write_rechecks_empty_active_key(self):
+        for index,text in enumerate(('2500','2,500','₦2500','N2500','2500 naira','For parts\n2500')):
+            for change in ('amount','inactive'):
+                with self.subTest(case=index,change=change):
+                    chat=f'race-{index}-{change}@lid'
+                    self.feed(WEMA+' Wema',chat=chat)
+                    initial=self.events[-1]
+                    self.clock=self.start+timedelta(seconds=12)
+                    row=message(len(self.bridge.messages)+1,text,timestamp=self.clock.isoformat(),chat_jid=chat)
+                    self.bridge.context=[self.bridge.messages[-1],row]
+                    key,body_hash,payload=self.detector.build(row)
+                    self.assertIsNotNone(payload)
+                    with self.state.db() as db:
+                        if change=='inactive':
+                            db.execute('UPDATE requests_latest SET active=0 WHERE request_key=?',(initial['request_key'],))
+                        else:
+                            card=dict(initial['card'])
+                            card['amount']={'value':'4000','currency':'NGN'}
+                            db.execute('UPDATE requests_latest SET card=? WHERE request_key=?',
+                                       (json.dumps(card),initial['request_key']))
+                        count=db.execute('SELECT count(*) FROM outbox').fetchone()[0]
+                    with self.assertRaisesRegex(RuntimeError,'bare_amount_request_no_longer_empty'):
+                        self.state.consume(row['sequence'],key,body_hash,payload)
+                    with self.state.db() as db:
+                        self.assertEqual(db.execute('SELECT count(*) FROM outbox').fetchone()[0],count)
+
+    def test_small_bare_numbers_and_malformed_grouping_stay_unset(self):
+        for index,text in enumerate(('5','99','N99','0','25,00','2,50','2500.','2500!')):
+            with self.subTest(case=index):
+                chat=f'invalid-format-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=list(self.events)
+                self.feed(text,12,chat=chat)
+                self.assertEqual(self.events,before)
+
+    def test_explicit_amounts_on_account_messages_still_work(self):
+        for index,(text,amount) in enumerate((('5k','5000'),('₦5,000','5000'),('send 6k','6000'))):
+            with self.subTest(case=index):
+                self.feed(WEMA+' Wema Demo '+text,chat=f'explicit-account-{index}@lid')
+                self.assertEqual(self.amount(self.events[-1]),amount)
+
+    def test_explicit_small_currency_and_k_amounts_still_work(self):
+        for index,(text,amount) in enumerate((('₦5','5'),('5 naira','5'),('5k','5000'),
+                                            ('₦5,000','5000'),('send 6k','6000'))):
+            with self.subTest(case=index):
+                chat=f'explicit-format-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=self.events[-1]
+                self.feed(text,12,chat=chat)
+                self.assert_update(before,self.events[-1],amount)
+
     def test_bare_number_without_preceding_account_is_ignored(self):
         self.feed('Please send 8k')
         before=list(self.events)
@@ -203,14 +318,15 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(len(self.latest()), 1)
         self.assert_update(self.steps[2][-1], self.events[-1], '8500')
 
-    def test_replay_04_bank_context_then_amount_updates_same_key(self):
+    def test_replay_04_bare_amount_after_owner_prompt_stays_unset(self):
         self.replay(4)
         self.assertEqual(len(self.latest()), 1)
         before = self.steps[2][-1]
         self.assertIsNone(self.amount(before))
         self.assertEqual(before['card']['account_number'], WEMA)
         self.assertEqual(before['card']['bank'], 'Wema')
-        self.assert_update(before, self.events[-1], '8500')
+        self.assertEqual(before, self.events[-1])
+        self.assertIsNone(self.amount(self.events[-1]))
 
     def test_replay_05_itemized_bill_with_misspelled_total(self):
         self.replay(5)

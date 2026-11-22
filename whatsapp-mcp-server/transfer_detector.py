@@ -186,7 +186,7 @@ class State:
                         owner=db.execute('SELECT request_key FROM message_requests WHERE source=?',(message_source,)).fetchone()
                         if owner and owner[0]!=request_key:raise RuntimeError('amount_fragment_already_consumed')
                     previous=db.execute('SELECT event_id,card,revision FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
-                    if re.fullmatch(r'[0-9]{3,6}',(payload.get('source',{}).get('content') or '').strip()):
+                    if 'standalone_amount_follow_up' in payload.get('candidate',{}).get('reasons',[]):
                         old_card=json.loads(previous[1]) if previous and previous[1] else {}
                         if (not old_card or old_card.get('amount') is not None or
                                 old_card.get('account_number')!=payload.get('card',{}).get('account_number')):
@@ -408,7 +408,7 @@ class Detector:
             latest=db.execute('SELECT card,amounts FROM requests_latest WHERE request_key=? AND active=1',
                               (request_key,)).fetchone()
         old_card=json.loads(latest[0]) if latest and latest[0] else {}
-        if re.fullmatch(r'[0-9]{3,6}',(row.get('content') or '').strip()):
+        if 'standalone_amount_follow_up' in clues['reasons']:
             if (not old_card or old_card.get('amount') is not None or
                     clues['account_number_candidates']!=[old_card.get('account_number')]):return skip()
         if (not clues['amount_candidates'] and old_card.get('amount') is not None and

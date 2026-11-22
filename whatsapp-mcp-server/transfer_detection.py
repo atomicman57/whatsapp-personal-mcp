@@ -277,6 +277,10 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         if not dry_run:return None
         text=text[len(TEST_PREFIX):]
     if excluded(source,text,exclusions) or non_request(text):return None
+    preceding=[x for x in context if x.get('id')!=source.get('id') and
+               x.get('chat_jid')==source.get('chat_jid') and age(source,x) is not None and
+               timedelta(0)<=age(source,x)<=timedelta(hours=2)]
+    immediate=preceding[-1] if preceding else None
     context=recent_context(source,context,dry_run)
     window=timedelta(seconds=link_window)
     ordered=[]
@@ -319,7 +323,16 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions,consumed)
         if from_excluded:return None
         amounts=found or []
-    if previous and not amounts:amounts=bare_amount(text,strict=False)
+    if not accounts and re.fullmatch(r'[0-9]+',text.strip()):
+        # Digit-only replies require an immediately preceding destination. The
+        # detector also checks that its persisted request still has no amount.
+        elapsed=age(source,previous) if previous else None
+        if not (re.fullmatch(r'[0-9]{3,6}',text.strip()) and int(text.strip())>0 and previous and immediate and
+                previous['id']==immediate['id'] and account_clues(previous.get('content','')) and
+                elapsed is not None and timedelta(0)<=elapsed<=window):return None
+        amounts=[{'text':text.strip(),'amount':str(int(text.strip())),
+                  'currency_hint':None,'currency_explicit':False}]
+    elif previous and not amounts:amounts=bare_amount(text,strict=False)
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []

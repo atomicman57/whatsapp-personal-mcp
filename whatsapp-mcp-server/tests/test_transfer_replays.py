@@ -86,9 +86,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(new['revision'], 1)
         self.assertEqual(new['card']['bank'], 'Wema')
 
-    @unittest.expectedFailure
     def test_replay_03_new_destination_then_bare_amount(self):
-        """xfail: bare 2500 conflicts with rejection of ungrouped non-whole-thousands replies."""
         self.replay(3)
         self.assertEqual(len(self.latest()), 2)
         self.assertIsNone(self.amount(self.destinations()[GTBANK]))
@@ -97,7 +95,104 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(before['card']['account_number'], WEMA)
         self.assertIsNone(self.amount(before))
         self.assert_update(before, after, '2500')
+        self.assertEqual(after['changed_fields'], ['amount'])
         self.assertEqual(self.amount(self.destinations()[WEMA]), '2500')
+
+    def feed(self, text, seconds=0, chat='99900001@lid'):
+        self.clock=self.start+timedelta(seconds=seconds)
+        row=message(len(self.bridge.messages)+1,text,timestamp=self.clock.isoformat(),chat_jid=chat)
+        self.bridge.messages.append(row)
+        self.bridge.context.append(row)
+        self.detector.drain()
+        with self.state.db() as db:
+            self.events=[json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox ORDER BY rowid')]
+        return self.events
+
+    def test_bare_number_without_preceding_account_is_ignored(self):
+        self.feed('Please send 8k')
+        before=list(self.events)
+        self.feed('2500',12)
+        self.assertEqual(self.events,before)
+        self.assertEqual(self.feed('2500',13,chat='other@lid'),before)
+
+    def test_bare_number_after_completed_account_is_ignored(self):
+        self.feed(WEMA+' Wema 4k')
+        before=list(self.events)
+        self.assertEqual(self.feed('2500',12),before)
+        self.assertEqual(self.amount(self.events[0]),'4000')
+
+    def test_bare_number_does_not_replace_previously_attached_amount(self):
+        self.feed(WEMA+' Wema')
+        self.feed('6k',6)
+        # Omitted bridge context cannot hide the already persisted amount.
+        self.bridge.context=self.bridge.context[:1]
+        completed=list(self.events)
+        self.assertEqual(self.feed('2500',8),completed)
+        self.feed(WEMA+' Wema',10)
+        # Repeated details open a new empty key; only that key can receive the reply.
+        before=self.events[-1]
+        self.feed('2500',12)
+        self.assert_update(before,self.events[-1],'2500')
+        self.assertEqual(self.amount(self.events[1]),'6000')
+        self.assertNotEqual(self.events[1]['request_key'],self.events[-1]['request_key'])
+        before=list(self.events)
+        self.assertEqual(self.feed('5000',13),before)
+
+    def test_bare_number_at_901_seconds_is_ignored(self):
+        self.feed(WEMA+' Wema')
+        before=list(self.events)
+        self.assertEqual(self.feed('2500',901),before)
+        self.assertIsNone(self.amount(self.events[0]))
+
+    def test_long_bare_numbers_and_phones_never_supply_amount(self):
+        for index,text in enumerate(('1000000','11111111','111111111','08000000001','23480000001')):
+            with self.subTest(length=len(text)):
+                chat=f'long-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=list(self.events)
+                self.assertEqual(self.feed(text,12,chat=chat),before)
+
+    def test_bare_number_after_unrelated_message_is_ignored(self):
+        for index,text in enumerate(('How is the weather?', 'Price is 5k in the market', 'Your access code: 123456')):
+            with self.subTest(kind=index):
+                chat=f'chatter-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                self.feed(text,6,chat=chat)
+                before=list(self.events)
+                self.assertEqual(self.feed('2500',12,chat=chat),before)
+
+    def test_three_to_six_digit_bare_amounts_and_window_boundary(self):
+        for index,text in enumerate(('500','2500','2026','12345','123456')):
+            with self.subTest(length=len(text)):
+                chat=f'positive-{index}@lid'
+                self.feed(WEMA+' Wema',chat=chat)
+                before=self.events[-1]
+                self.feed(text,900,chat=chat)
+                self.assert_update(before,self.events[-1],text)
+                self.assertEqual(self.events[-1]['changed_fields'],['amount'])
+
+    def test_bare_amount_needs_an_emitted_active_key(self):
+        self.feed(WEMA+' Wema')
+        with self.state.db() as db:
+            db.execute('UPDATE requests_latest SET active=0')
+        before=list(self.events)
+        self.assertEqual(self.feed('2500',12),before)
+
+    def test_bare_amount_and_source_survive_restart_and_outbox_cleanup(self):
+        self.feed(WEMA+' Wema')
+        self.feed('2500',12)
+        original=self.events[-1]
+        with self.state.db() as db:
+            db.execute('DELETE FROM outbox')
+        self.detector=Detector(State(self.directory.name),self.bridge,FakeWebhook(),'replay-instance','15550000001')
+        self.detector.initialize()
+        self.feed('For coil and plug',20)
+        after,=self.events
+        self.assertEqual(after['request_key'],original['request_key'])
+        self.assertEqual(after['revision'],3)
+        self.assertEqual(after['changed_fields'],['purpose'])
+        self.assertEqual(self.amount(after),'2500')
+        self.assertEqual(after['candidate']['amount_candidates'][0]['source_message_id'],'message-2')
 
     @unittest.expectedFailure
     def test_replay_04_caption_bank_then_late_amount(self):
@@ -172,11 +267,12 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(self.events[0], original)
         self.assertIsNone(self.amount(self.events[-1]))
 
-    def test_replay_03_destination_isolation_even_when_bare_amount_rejected(self):
+    def test_replay_03_bare_amount_only_updates_latest_destination(self):
         self.replay(3)
         self.assertEqual(len(self.latest()), 2)
         self.assertEqual(set(self.destinations()), {WEMA, GTBANK})
-        self.assertTrue(all(self.amount(event) is None for event in self.events))
+        self.assertIsNone(self.amount(self.destinations()[GTBANK]))
+        self.assertEqual(self.amount(self.destinations()[WEMA]), '2500')
         self.assertNotEqual(self.destinations()[WEMA]['request_key'], self.destinations()[GTBANK]['request_key'])
 
     def test_replay_07_next_day_any_amount_stays_unset(self):

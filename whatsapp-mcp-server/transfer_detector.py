@@ -100,6 +100,8 @@ class State:
                 CREATE TABLE IF NOT EXISTS name_enquiries(event_id TEXT PRIMARY KEY,payload TEXT,status TEXT NOT NULL DEFAULT 'pending');''')
             if 'card' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
                 db.execute('ALTER TABLE requests_latest ADD COLUMN card TEXT')
+            if 'amounts' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
+                db.execute('ALTER TABLE requests_latest ADD COLUMN amounts TEXT')
             if 'revision' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
                 db.execute('ALTER TABLE requests_latest ADD COLUMN revision INTEGER NOT NULL DEFAULT 1')
             db.execute('CREATE TABLE IF NOT EXISTS message_requests(source TEXT PRIMARY KEY,request_key TEXT NOT NULL)')
@@ -184,13 +186,18 @@ class State:
                         owner=db.execute('SELECT request_key FROM message_requests WHERE source=?',(message_source,)).fetchone()
                         if owner and owner[0]!=request_key:raise RuntimeError('amount_fragment_already_consumed')
                     previous=db.execute('SELECT event_id,card,revision FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
+                    if re.fullmatch(r'[0-9]{3,6}',(payload.get('source',{}).get('content') or '').strip()):
+                        old_card=json.loads(previous[1]) if previous and previous[1] else {}
+                        if (not old_card or old_card.get('amount') is not None or
+                                old_card.get('account_number')!=payload.get('card',{}).get('account_number')):
+                            raise RuntimeError('bare_amount_request_no_longer_empty')
                     payload['revision']=previous[2]+int(previous[0]!=payload['event_id']) if previous else 1
                     if previous and previous[0]!=payload['event_id']:
                         old_card=json.loads(previous[1]) if previous[1] else {}
                         new_card=payload.get('card',{})
                         payload.update(event_type='candidate_updated',previous_event_id=previous[0],revision_hint='replace_card_for_request_key',
                             changed_fields=sorted(k for k in old_card.keys()|new_card.keys() if old_card.get(k)!=new_card.get(k)))
-                    db.execute('INSERT OR REPLACE INTO requests_latest(request_key,event_id,chat_jid,active,card,revision) VALUES(?,?,?,1,?,?)',(request_key,payload['event_id'],payload['source']['chat_jid'],json.dumps(payload.get('card',{})),payload['revision']))
+                    db.execute('INSERT OR REPLACE INTO requests_latest(request_key,event_id,chat_jid,active,card,revision,amounts) VALUES(?,?,?,1,?,?,?)',(request_key,payload['event_id'],payload['source']['chat_jid'],json.dumps(payload.get('card',{})),payload['revision'],json.dumps(payload.get('candidate',{}).get('amount_candidates',[]))))
                     self._own_messages(db,payload)
                 payload=self._queue(db,source,payload)
                 if payload.get('card',{}).get('account_name_reason')=='pending_nonblocking':
@@ -396,6 +403,22 @@ class Detector:
         consumed=self.state.consumed_messages(self.account,row['chat_jid'],rows)
         clues=classify(row,rows,dry_run,self.link_window,self.exclusions,consumed)
         if not clues:return skip()
+        request_key=digest(self.account,row['chat_jid'],clues['anchor_message_id'])
+        with self.state.lock,self.state.db() as db:
+            latest=db.execute('SELECT card,amounts FROM requests_latest WHERE request_key=? AND active=1',
+                              (request_key,)).fetchone()
+        old_card=json.loads(latest[0]) if latest and latest[0] else {}
+        if re.fullmatch(r'[0-9]{3,6}',(row.get('content') or '').strip()):
+            if (not old_card or old_card.get('amount') is not None or
+                    clues['account_number_candidates']!=[old_card.get('account_number')]):return skip()
+        if (not clues['amount_candidates'] and old_card.get('amount') is not None and
+                clues['account_number_candidates']==[old_card.get('account_number')] and
+                {'purpose_follow_up','attachment_in_request_context'} & set(clues['reasons'])):
+            clues['amount_candidates']=json.loads(latest[1]) if latest[1] else []
+            for amount in clues['amount_candidates']:
+                if amount['source_message_id'] not in clues['source_message_ids']:
+                    clues['source_message_ids'].append(amount['source_message_id'])
+            clues['amount_missing']=not clues['amount_candidates']
         cleaned,truncated=safe_context(rows)
         base['source']['content']=(row.get('content') or '')[:2000]
         base['source']['phone_number']=phone
@@ -404,7 +427,7 @@ class Detector:
             card['account_name_reason']='pending_nonblocking' if card['account_number'] and card['bank'] else 'destination_missing_or_ambiguous'
         return source_key,body_hash,timed({**base,'event_type':'transfer_request_candidate','candidate':clues,
             'card':card,'requester_is_saved_contact':card['requester_is_saved_contact'],
-            'request_key':digest(self.account,row['chat_jid'],clues['anchor_message_id']),
+            'request_key':request_key,
             'context':cleaned,'context_truncated':truncated or len(row.get('content',''))>2000,
             'context_may_be_incomplete':len(context)>=50 or not any(x['id']==row['id'] for x in rows),
             'dry_run':dry_run,'previous_event_id':prior[1] if prior else None})

@@ -114,7 +114,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(result['amount_missing'])
         account=message(3,'0111122223')
         bank=message(4,'Sterling Vendor Three')
-        amount=message(5,'5000')
+        amount=message(5,'5,000')
         for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
             result=classify(source,context)
             self.assertEqual(result['anchor_message_id'],account['id'])
@@ -143,7 +143,8 @@ class ClassifierTests(unittest.TestCase):
         result=classify(follow,[previous,follow])
         self.assertEqual(result['anchor_message_id'],'message-1')
         self.assertFalse(result['amount_missing'])
-        follow=message(3,'50000')
+        self.assertIsNone(classify(message(3,'50000'),[previous]))
+        follow=message(3,'50,000')
         self.assertEqual(classify(follow,[previous,follow])['amount_candidates'][0]['amount'],'50000')
         result=classify(message(text='Please help me with money for school fees'))
         self.assertTrue(result['amount_missing'])
@@ -797,8 +798,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(updated['previous_event_id'],first['event_id'])
         self.assertEqual(updated['event_type'],'candidate_updated')
         self.assertEqual(updated['card']['amount']['value'],'395000')
-    def test_account_then_year_code_digit_or_phone_reply_stays_amount_missing(self):
-        for text in ('2026','123456','5','08000000001'):
+    def test_account_then_short_digit_or_phone_reply_stays_amount_missing(self):
+        for text in ('5','08000000001'):
             self.setUp()
             self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
             self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
@@ -810,7 +811,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(json.loads(payload)['source']['id'],'synthetic-vendor-1',text)
             self.assertTrue(json.loads(payload)['candidate']['amount_missing'],text)
     def test_account_then_small_or_real_amount_reply_completes(self):
-        for text,amount in (('1,900','1900'),('5000','5000'),('500','500'),('2,500','2500')):
+        for text,amount in (('1,900','1900'),('5000','5000'),('500','500'),('2,500','2500'),('2026','2026'),('123456','123456')):
             self.setUp()
             self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
             self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()

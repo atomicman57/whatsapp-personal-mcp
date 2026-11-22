@@ -18,7 +18,7 @@ def payload(event='event-1', key='request-1', **extra):
     return {'event_id': event, 'request_key': key, 'event_type': 'transfer_request_candidate',
             'source_account': 'synthetic', 'source': {'chat_jid': 'invented@lid', 'content': 'PRIVATE MESSAGE'},
             'card': {'amount': {'value': '40000', 'currency': 'NGN'},
-                     'account_number': '0123456789', 'account_name': None}, **extra}
+                     'account_number': '0000012345', 'account_name': None}, **extra}
 
 
 def call_intake(args):
@@ -33,7 +33,7 @@ class IntakeTests(unittest.TestCase):
 
     def test_repeat_upsert_related_and_private_compact_output(self):
         first = intake.intake(self.root, payload())
-        self.assertEqual(first['request']['last4'], '6789')
+        self.assertEqual(first['request']['last4'], '2345')
         self.assertTrue(intake.intake(self.root, payload())['duplicate'])
         updated = payload('event-2', previous_event_id='event-1', event_type='candidate_updated', changed_fields=['amount'])
         updated['card']['amount']['value'] = '50000'
@@ -43,13 +43,13 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(rows[0]['amount'], '50000')
         result = intake.intake(self.root, payload('event-3', 'request-2'))
         self.assertEqual(result['related_requests'], [
-            {'request_key': 'request-1', 'event_id': 'event-2', 'state': 'pending', 'amount': '50000', 'last4': '6789'}])
+            {'request_key': 'request-1', 'event_id': 'event-2', 'state': 'pending', 'amount': '50000', 'last4': '2345'}])
         output = intake.compact(result)
-        self.assertNotIn('0123456789', output)
+        self.assertNotIn('0000012345', output)
         self.assertNotIn('PRIVATE MESSAGE', output)
         events = (self.root / 'events.jsonl').read_text()
         self.assertNotIn('PRIVATE MESSAGE', events)
-        self.assertNotIn('0123456789', events)
+        self.assertNotIn('0000012345', events)
         self.assertEqual(list(json.loads(events.splitlines()[0])),
                          ['event_id', 'request_key', 'event_type', 'previous_event_id', 'at', 'applied', 'changed_fields'])
         self.assertEqual((self.root / 'requests.jsonl').stat().st_mode & 0o777, 0o600)
@@ -60,7 +60,7 @@ class IntakeTests(unittest.TestCase):
         second['source']['chat_jid'] = 'other@lid'
         self.assertEqual(len(intake.intake(self.root, second)['related_requests']), 1)
         third = payload('event-3', 'request-3')
-        third['card']['account_number'] = '9876543210'
+        third['card']['account_number'] = '1111122222'
         self.assertEqual(len(intake.intake(self.root, third)['related_requests']), 1)
         with patch.object(intake, 'now', return_value=intake.now() + timedelta(days=15)):
             self.assertEqual(intake.intake(self.root, payload('event-4', 'request-4'))['related_requests'], [])
@@ -140,7 +140,7 @@ class IntakeTests(unittest.TestCase):
 
     def test_numeric_account_is_rejected_without_writes(self):
         value = payload()
-        value['card']['account_number'] = 1234567890
+        value['card']['account_number'] = 1111122222
         with self.assertRaises(ValueError):
             intake.intake(self.root, value)
         self.assertFalse((self.root / 'events.jsonl').exists())
@@ -149,9 +149,9 @@ class IntakeTests(unittest.TestCase):
         command = [sys.executable, str(SCRIPT), '--state-dir', str(self.root)]
         result = subprocess.run(command, input=json.dumps(payload()), text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn('0123456789', result.stdout)
+        self.assertNotIn('0000012345', result.stdout)
         self.assertNotIn('PRIVATE MESSAGE', result.stdout)
-        result = subprocess.run(command, input='PRIVATE MESSAGE 0123456789', text=True, capture_output=True)
+        result = subprocess.run(command, input='PRIVATE MESSAGE 0000012345', text=True, capture_output=True)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, '{"error":"intake_failed"}\n')
         self.assertEqual(result.stderr, '')

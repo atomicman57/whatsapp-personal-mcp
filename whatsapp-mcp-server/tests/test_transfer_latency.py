@@ -173,7 +173,7 @@ class LatencyTests(unittest.TestCase):
         response = requests.get(base+'/latency?days=14',headers=auth)
         self.assertEqual(response.status_code,200)
         self.assertNotIn('content',response.text)
-        self.assertNotIn('0123456789',response.text)
+        self.assertNotIn('0000012345',response.text)
 
     def test_late_stage_time_formats_and_default(self):
         key = self.add(message())[0]
@@ -301,7 +301,7 @@ class LatencyTests(unittest.TestCase):
         self.detector.deliver_one()
         self.state = State(self.root)
         self.detector.state = self.state
-        self.add(message(2, 'Please send NGN 15,000 for plumbing. Bank: Demo Bank. Account 0123456789.', id='message-1'))
+        self.add(message(2, 'Please send NGN 15,000 for plumbing. Bank: Demo Bank. Account 0000012345.', id='message-1'))
         updated = self.state.due()[1]
         self.assertEqual(updated['previous_event_id'], first['event_id'])
         self.assertEqual(updated['changed_fields'], ['amount'])

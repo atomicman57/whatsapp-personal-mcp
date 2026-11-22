@@ -1,0 +1,407 @@
+{
+  "1": {
+    "description": "Compact `7k` in one message",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "",
+        "media_type": "audio",
+        "media_description": "voice note, untranscribed"
+      },
+      {
+        "offset_seconds": 120,
+        "owner": true,
+        "content": "Call him on +2348000000001",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 840,
+        "owner": false,
+        "content": "0000012345 Wema \nIbrahim 7k",
+        "media_type": ""
+      }
+    ]
+  },
+  "2": {
+    "description": "Account, name, and bank in separate messages; do not inherit last night’s amount",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "1111122222",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 5,
+        "owner": false,
+        "content": "Chidi",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 8,
+        "owner": false,
+        "content": "GTBank",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 10,
+        "owner": false,
+        "content": "8k",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 13,
+        "owner": false,
+        "content": "I’m here",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 50400,
+        "owner": false,
+        "content": "0000012345",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 50405,
+        "owner": false,
+        "content": "Ada Okon",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 50413,
+        "owner": false,
+        "content": "Wema bank",
+        "media_type": ""
+      }
+    ]
+  },
+  "3": {
+    "description": "Bare amount shortly after a new account; earlier account in the same chat is separate",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "1111122222\nGTBank",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 15,
+        "owner": false,
+        "content": "Ok sir",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 17,
+        "owner": true,
+        "content": "For the transport? or for him",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 58,
+        "owner": false,
+        "content": "Transport",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 257,
+        "owner": false,
+        "content": "Wema \nBola Mensah \n0000012345",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 269,
+        "owner": false,
+        "content": "2500",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 344,
+        "owner": false,
+        "content": "For coil and plug",
+        "media_type": ""
+      }
+    ]
+  },
+  "4": {
+    "description": "Amount arrives only after Owner says the figure is unreadable",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "0000012345\nTotal service",
+        "media_type": "image",
+        "media_description": "image, amount on the photo is unclear"
+      },
+      {
+        "offset_seconds": 26,
+        "owner": true,
+        "content": "Bank?",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 37,
+        "owner": false,
+        "content": "Wema bank",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 38,
+        "owner": true,
+        "content": "I can’t see how much well",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 68,
+        "owner": false,
+        "content": "8,500",
+        "media_type": ""
+      }
+    ]
+  },
+  "5": {
+    "description": "Itemized `k` lines with typo `totat`",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "Sir,\nthe guy is waiting so they don't close",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 3300,
+        "owner": false,
+        "content": "Screw-1k\npeg-1k\nsilicon-2k\nworkmanship/tp-2k\n  totat-6k\n 0000012345 Wema \nChinedu-6k",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 3309,
+        "owner": false,
+        "content": "for the glass",
+        "media_type": ""
+      }
+    ]
+  },
+  "6": {
+    "description": "Do not inherit yesterday’s amount onto today’s destination",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "The test costs ₦9,000, and I'm hoping to have it done today. Please, comman help me now even its to borrow me pls. Even if you cannot afford the entire amount, anything you can contribute towards it would go a long way. last elp this year i cross my heart pls.",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 53,
+        "owner": false,
+        "content": "because of the test they asked me to do. They referred me to have it done as soon as possible.\n\nThe procedure costs ₦9,000, and I'm hoping to have it done and get my results today.",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 180,
+        "owner": false,
+        "content": "pls what can i use to beg you like this. pls nau oya jjust borrow me the money for now pls. pls nau. walahi youre actually my only hope rn pls. even if its half pls",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 61200,
+        "owner": false,
+        "content": "Good Morning, pls i'm currently very sick and im very drained both mentally and finincially rn",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 61251,
+        "owner": false,
+        "content": "if you can help pls do thanks, 0000012345 wema. thanks",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 61800,
+        "owner": false,
+        "content": "I still need to do chest Xray, ct scan and an ENT examination, currently on my way to pick up my yesterday test result, ive not eaten, after getting there i dont even have tfrare back to the hospital or even back home.",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 61800,
+        "owner": false,
+        "content": "if you can help this morning pls do, cos im extremely drained. thank you",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 62160,
+        "owner": false,
+        "content": "Sputum Culture this test too, forgot to mention.",
+        "media_type": ""
+      }
+    ]
+  },
+  "7": {
+    "description": "Approximate amount, then hours later “any amount”, then the account",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "",
+        "media_type": "audio",
+        "media_description": "voice note, untranscribed"
+      },
+      {
+        "offset_seconds": 180,
+        "owner": false,
+        "content": "",
+        "media_type": "image",
+        "media_description": "image: family photo, not a bill or account screenshot"
+      },
+      {
+        "offset_seconds": 240,
+        "owner": false,
+        "content": "that's my first daughter the one on blue beside her my second daughter and my wife",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 720,
+        "owner": false,
+        "content": "I need like 8k from you sir, sa a loan from you please 🙏🙏🙏🙏🙏",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 11760,
+        "owner": false,
+        "content": "Hello sir",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 57780,
+        "owner": false,
+        "content": "Good morning sir",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 58980,
+        "owner": false,
+        "content": "aaa",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 62220,
+        "owner": false,
+        "content": "any amount you can give me bro, I will add it with one I have with me",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 62280,
+        "owner": false,
+        "content": "Wema 0000012345 Chuka Okeke",
+        "media_type": ""
+      }
+    ]
+  },
+  "8": {
+    "description": "Held balance is not a request to send money",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "Good morning sir",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 97,
+        "owner": false,
+        "content": "Chef said there are something I need to get extra like \nMaggi \nYour spa\nI still have your balance of 5k",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 115,
+        "owner": false,
+        "content": "I want to go get at Blenco",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 2520,
+        "owner": true,
+        "content": "Ok",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 2525,
+        "owner": true,
+        "content": "Please go",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 2820,
+        "owner": false,
+        "content": "",
+        "media_type": "image",
+        "media_description": "image: uncaptioned shop receipt"
+      },
+      {
+        "offset_seconds": 2880,
+        "owner": true,
+        "content": "Great",
+        "media_type": ""
+      }
+    ]
+  },
+  "9": {
+    "description": "Product-page images with prices, no checkout total",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "Hey hun\nPls nau will you buy blue bunny icecream and pizza for me pls ☹️\nOshey baby",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 28560,
+        "owner": true,
+        "content": "Ok baby",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 29640,
+        "owner": false,
+        "content": "0000012345 wema\nThank youuuu",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 29641,
+        "owner": false,
+        "content": "",
+        "media_type": "image",
+        "media_description": "image: food-delivery product page, Club Pizza - Large NGN 3800"
+      },
+      {
+        "offset_seconds": 29641,
+        "owner": false,
+        "content": "Thanks bb",
+        "media_type": "image",
+        "media_description": "image: food-delivery product page, Blue Bunny ice cream NGN 4100"
+      }
+    ]
+  },
+  "10": {
+    "description": "Formal itemized quotation plus a same-timestamp account; earlier same-chat request stays separate",
+    "messages": [
+      {
+        "offset_seconds": 0,
+        "owner": false,
+        "content": "1111122222 GTBank Noah \n8k for ladder",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 1112,
+        "owner": false,
+        "content": "Good evening, sir.\n\nQUOTATION FOR AC WORK\n\nMaterials:\n\n1. AC Pipe – ₦2,000\n2. AC Wire – ₦1,200 × 1 yard = ₦1,200\n3. Gas – ₦2,000 × 1kg = ₦2,000\n\nTotal Materials: ₦5,200\n\nWorkmanship (Separate):\n\n- Loosening the AC, welding the pipe back, and arranging and mounting the AC back in position – ₦2,000.\n\nGrand Total: ₦7,200\n\nThank you, sir.",
+        "media_type": ""
+      },
+      {
+        "offset_seconds": 1112,
+        "owner": false,
+        "content": "0000012345 fakoya Tunde wema",
+        "media_type": ""
+      }
+    ]
+  }
+}

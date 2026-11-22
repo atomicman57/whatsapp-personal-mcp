@@ -31,7 +31,7 @@ TEST_PREFIX = 'TRANSFER_DETECTOR_TEST:'
 PURPOSE = re.compile(r'^(?:for\b|waybill\b|drinks\b|delivery\b|transport\b|gas\b|fuel\b|rent\b|school fees\b|electrician\b|plumbing\b|workmanship\b)',re.I)
 TOTAL = re.compile(r'\b(?:total|balance|amount)\s*[:=\-]*\s*(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
 # A line that starts with TOTAL ("TOTAL==== 63,500", "Total= 51,500") closes an itemized bill.
-STANDALONE_TOTAL = re.compile(r'^[ \t]*(?:grand[ \t]+)?total[ \t]*[:=\-]*[ \t]*(₦|NGN|N(?=[ \t]*\d))?[ \t]*(\d[\d,]*(?:\.\d{1,2})?)[ \t]*(k|m|thousand|million)?(?![\w,])',re.I|re.M)
+STANDALONE_TOTAL = re.compile(r'^[ \t]*(?:grand[ \t]+)?(?:total|totat)[ \t]*[:=\-]*[ \t]*(₦|NGN|N(?=[ \t]*\d))?[ \t]*(\d[\d,]*(?:\.\d{1,2})?)[ \t]*(k|m|thousand|million)?(?![\w,])',re.I|re.M)
 # "U.B.A", "u b a", "G.T.B." -> acronym, only when the letters spell a known bank.
 DOTTED_ACRONYM = re.compile(r'(?<![A-Za-z0-9])[A-Za-z](?:(?:[ \t]*\.[ \t]*|[ \t]+)[A-Za-z]){1,3}\.?(?![A-Za-z0-9])')
 BANK_ACRONYMS = {'UBA','GTB','GTCO','FCMB'}
@@ -149,6 +149,7 @@ def amount_clues(text):
     if total:return [total]
     result=[]
     for match in AMOUNT.finditer(text):
+        if re.search(r'\b(?:like|about|around|approximately|roughly)\s*$',text[:match.start()],re.I):continue
         try:
             number=Decimal((match.group(1) or match.group(3)).replace(',',''))
             suffix=(match.group(2) or match.group(4) or '').lower()
@@ -219,6 +220,8 @@ def sensitive(text):
 
 def non_request(text):
     """Prices, rate quotations and advertised menus cannot complete a request."""
+    payment_action=re.search(r'\b(?:send|transfer|pay|deposit|owe|settle)\b',text,re.I)
+    if not payment_action and re.search(r'\bquotation\b|\b(?:i|we) (?:still )?have your balance\b',text,re.I):return True
     if re.search(r"\bprice\b|\b(?:at|in|for)\s+(?:the\s+)?market\b",text,re.I) and not re.search(r"\b(?:send|transfer|pay|deposit|owe|settle)\b",text,re.I):return True
     if re.search(r'\b(?:rate|exchange rate)\s*[:=@-]?\s*\d',text,re.I) and not account_clues(text):return True
     if re.search(r'\b(?:transfer|buy|sell)\s+\d+(?:\.\d+)?\s*/\s*\d+',text,re.I):return True
@@ -345,6 +348,11 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if IMPLICIT.search(text):reasons.append('possible_bill_or_supply_request')
     if follow_up:reasons.append('amount_follow_up')
     purpose_follow_up=bool(previous and PURPOSE.search(text.strip()) and len(text)<400)
+    attachment_follow_up=source.get('media_type') in ('image','document') and previous
+    if (purpose_follow_up or attachment_follow_up) and previous_accounts and not accounts and elapsed is not None and elapsed<=window:
+        # Context-only follow-ups keep the established destination and amount.
+        accounts=previous_accounts;account_source=previous['id']
+        if not amounts:amounts=[{**x,'source_message_id':previous['id']} for x in amount_clues(previous.get('content',''))]
     if purpose_follow_up:reasons.append('purpose_follow_up')
     if source.get('media_type') in ('image','document') and previous:reasons.append('attachment_in_request_context')
     if not reasons:return None
@@ -365,7 +373,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             'bank_name_candidates':bank_name_candidates(*(texts.get(x,'') for x in source_ids)),
             'amount_candidates':amounts,'anchor_message_id':anchor,'source_message_ids':source_ids,
             'beneficiary_verified':False,
-            'amount_ambiguous':len({(x['amount'],x['currency_hint']) for x in amounts})>1,
+            'amount_ambiguous':len(amounts)>1,
             'different_destination_from_previous':different_destination,
             'amount_missing':not amounts,
             'attachment_extraction_needed':source.get('media_type') in ('image','document')}

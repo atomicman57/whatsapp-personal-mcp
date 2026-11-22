@@ -59,7 +59,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result['anchor_message_id'], details['id'])
 
     def test_real_intake_shapes_with_synthetic_identifiers(self):
-        compact=classify(message(text='0000012345 Moniepoint\nDemo Beneficiary 1900'))
+        compact=classify(message(text='0000012345 Moniepoint\nDemo Beneficiary ₦1900'))
         self.assertEqual([x['amount'] for x in compact['amount_candidates']],['1900'])
         self.assertEqual(compact['account_number_candidates'],['0000012345'])
         itemized=classify(message(text='Room AC total-105k\nOffice AC total-48,500\n0000012345 Access Bank Demo'))
@@ -74,7 +74,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result['account_number_candidates'],['0000012345'])
         self.assertEqual(result['account_source_message_id'],account['id'])
         self.assertEqual(result['anchor_message_id'],account['id'])
-        later=classify(message(3,'1,900'),[account,bank])
+        later=classify(message(3,'send ₦1900'),[account,bank])
         self.assertEqual(later['anchor_message_id'],account['id'])
         self.assertEqual(later['amount_candidates'][0]['amount'],'1900')
         self.assertIsNotNone(classify(account,[message(0,'Moniepoint'),account]))
@@ -114,14 +114,14 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(result['amount_missing'])
         account=message(3,'0111122223')
         bank=message(4,'Sterling Vendor Three')
-        amount=message(5,'5,000')
+        amount=message(5,'5k')
         for source,context in [(account,[new,account]),(bank,[new,account,bank]),(amount,[new,account,bank,amount])]:
             result=classify(source,context)
             self.assertEqual(result['anchor_message_id'],account['id'])
             if source!=amount:self.assertTrue(result['amount_missing'])
     def test_five_part_conversation_retains_original_request_anchor(self):
         rows=[message(1,'Please send money for plumbing repairs'),message(2,'000 001 2345'),
-              message(3,'Sterling Demo Beneficiary'),message(4,'1,900'),message(5,'waybill')]
+              message(3,'Sterling Demo Beneficiary'),message(4,'1.9k'),message(5,'waybill')]
         for i,row in enumerate(rows):
             result=classify(row,rows[:i+1])
             self.assertIsNotNone(result)
@@ -133,7 +133,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertFalse(result['beneficiary_verified'])
         self.assertEqual(amount_clues('Abeg I need 50k for gas')[0]['amount'],'50000')
         self.assertFalse(amount_clues('Abeg I need 50k for gas')[0]['currency_explicit'])
-        self.assertEqual(amount_clues('Please send me 5000')[0]['currency_hint'],None)
+        self.assertEqual(amount_clues('Please send me 5000'),[])
         self.assertEqual(amount_clues('Please send USD 50.25')[0]['currency_hint'],'USD')
         self.assertFalse(amount_clues('send 0000012345'))
         self.assertLessEqual(len(amount_clues('Please send NGN 5'+','*10000+'000')[0]['text']),100)
@@ -145,7 +145,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertFalse(result['amount_missing'])
         self.assertIsNone(classify(message(3,'50000'),[previous]))
         follow=message(3,'50,000')
-        self.assertEqual(classify(follow,[previous,follow])['amount_candidates'][0]['amount'],'50000')
+        self.assertIsNone(classify(follow,[previous,follow]))
         result=classify(message(text='Please help me with money for school fees'))
         self.assertTrue(result['amount_missing'])
         self.assertIsNotNone(classify(message(text='Sir, gas don finish')))

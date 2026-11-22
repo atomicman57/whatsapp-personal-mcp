@@ -24,7 +24,6 @@ ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
 BANK = re.compile(r'\b(?:bank|acct|account(?: number)?|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
 AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million|naira)\b',re.I)
-BARE_AMOUNT = re.compile(r'\b(?:send|transfer|pay|need|borrow|lend|owe|balance|total)\s+(?:me\s+)?(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
 FX_AMOUNT = re.compile(r'(USD|EUR|GBP|\$|€|£)\s*(\d[\d,]*(?:\.\d{1,2})?)',re.I)
 IMPLICIT = re.compile(r'\b(?:gas|fuel|rent|school fees|electricity bill)\b.{0,50}\b(?:finish(?:ed)?|due|expired|renew)\b',re.I)
 TEST_PREFIX = 'TRANSFER_DETECTOR_TEST:'
@@ -155,6 +154,7 @@ def amount_clues(text):
             suffix=(match.group(2) or match.group(4) or '').lower()
             number*= {'k':1000,'thousand':1000,'m':1000000,'million':1000000}.get(suffix,1)
             if number<=0 or number>Decimal('1000000000000'):continue
+            if number<100 and not (suffix or '₦' in match.group(0)):continue
             result.append({'text':match.group(0).strip()[:100],'amount':format(number,'f'),
                            'currency_hint':'NGN','currency_explicit':bool(match.group(1) or suffix=='naira')})
         except InvalidOperation:continue
@@ -163,12 +163,6 @@ def amount_clues(text):
         if 0<number<=Decimal('1000000000000'):
             currency={'$':'USD','€':'EUR','£':'GBP'}.get(match.group(1),match.group(1).upper())
             result.append({'text':match.group(0)[:100],'amount':format(number,'f'),'currency_hint':currency,'currency_explicit':True})
-    for match in BARE_AMOUNT.finditer(text):
-        value=match.group(1).replace(',','')
-        if len(value.split('.')[0])==10:continue
-        number=Decimal(value)
-        if 0<number<=Decimal('1000000000000'):
-            result.append({'text':match.group(1)[:100],'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False})
     return result[:10]
 
 # A short trailing run of punctuation/emoji ("395,000.", "395,000 ✅"), never prose.
@@ -206,6 +200,25 @@ def bare_amount(text,strict=True):
     except InvalidOperation:return []
     if not 0<number<=Decimal('1000000000000') or number<(1000 if strict else 100):return []
     return [{'text':text.strip(),'amount':format(number,'f'),'currency_hint':None,'currency_explicit':False}]
+
+# A full line prevents labels and sentence fragments from becoming amounts.
+STANDALONE_AMOUNT = re.compile(r'[ \t]*(₦|NGN|N)?[ \t]*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)[ \t]*(naira)?[ \t]*',re.I)
+
+def standalone_amounts(text):
+    result=[]
+    for line in (text or '').splitlines():
+        match=STANDALONE_AMOUNT.fullmatch(line)
+        if not match:continue
+        prefix,raw,suffix=match.groups()
+        whole=raw.split('.')[0];digits=whole.replace(',','')
+        if len(digits)>(12 if prefix or suffix else 6) or (',' in whole and not GROUPED.fullmatch(whole)):continue
+        number=Decimal(raw.replace(',',''))
+        # N alone is not enough to make a sub-100 number unambiguous.
+        explicit=bool(prefix or suffix)
+        if number<=0 or (number<100 and not (prefix=='₦' or suffix)):continue
+        result.append({'text':line.strip(),'amount':format(number,'f'),
+                       'currency_hint':'NGN' if explicit else None,'currency_explicit':explicit})
+    return result[:10]
 
 def settled(text):
     """Past-tense settlement not preceded by a nearby conditional or negation."""
@@ -309,9 +322,8 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             accounts=account_clues(nearby.get('content',''));account_source=nearby['id']
     amounts=amount_clues(text)
     if accounts and has_bank(text) and not total_clue(text):
-        # Account/name/"1900" and itemized "total-48,500" are actual intake formats.
-        for match in list(TOTAL.finditer(text))+list(re.finditer(r'(?<![\d,])(\d[\d,]*(?:\.\d{1,2})?)\s*$',text)):
-            if re.search(r'\btest\s*$',text[:match.start(1)],re.I):continue
+        # Preserve structured itemized totals, never infer a trailing label number.
+        for match in TOTAL.finditer(text):
             value=match.group(1).replace(',','')
             if re.match(r'\s*(?:k|m|thousand|million|naira)\b',text[match.end(1):],re.I):continue
             if len(value.split('.')[0])==10 or any(match.start(1)>=a.start() and match.end(1)<=a.end() for a in ACCOUNT.finditer(text)):continue
@@ -323,16 +335,18 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
         found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions,consumed)
         if from_excluded:return None
         amounts=found or []
-    if not accounts and re.fullmatch(r'[0-9]+',text.strip()):
-        # Digit-only replies require an immediately preceding destination. The
-        # detector also checks that its persisted request still has no amount.
+    standalone=standalone_amounts(text) if not accounts else []
+    standalone_follow_up=False
+    standalone_line=any(STANDALONE_AMOUNT.fullmatch(line) for line in text.splitlines())
+    explicit_prose=any(not STANDALONE_AMOUNT.fullmatch(x['text']) for x in amounts)
+    if not accounts and standalone_line and not explicit_prose:
+        # All standalone reply formats share the same context and state guards.
         elapsed=age(source,previous) if previous else None
-        if not (re.fullmatch(r'[0-9]{3,6}',text.strip()) and int(text.strip())>0 and previous and immediate and
-                previous['id']==immediate['id'] and account_clues(previous.get('content','')) and
-                elapsed is not None and timedelta(0)<=elapsed<=window):return None
-        amounts=[{'text':text.strip(),'amount':str(int(text.strip())),
-                  'currency_hint':None,'currency_explicit':False}]
-    elif previous and not amounts:amounts=bare_amount(text,strict=False)
+        if not (standalone and previous and immediate and previous['id']==immediate['id'] and
+                account_clues(previous.get('content','')) and elapsed is not None and
+                timedelta(0)<=elapsed<=min(window,timedelta(seconds=LINK_WINDOW_SECONDS))):return None
+        amounts=standalone
+        standalone_follow_up=True
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []
@@ -355,7 +369,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if follow_up and not accounts and previous_accounts:
         accounts=previous_accounts;account_source=previous['id']
         if anchor==source.get('id'):anchor=previous['id']
-    reasons=[]
+    reasons=['standalone_amount_follow_up'] if standalone_follow_up else []
     if accounts and (has_bank(text) or previous or any(has_bank(x.get('content','')) for x in prior[:3])):reasons.append('payment_details_with_context')
     if direct:reasons.append('request_language_with_money_or_amount')
     if IMPLICIT.search(text):reasons.append('possible_bill_or_supply_request')

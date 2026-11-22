@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from intake_alerts import (AlertClient, AlertWorker, delete_intake_alert, format_alert,
-                           list_intake_alerts, queue)
+                           list_intake_alerts, cleanup_intake_alert_tombstones, queue)
 from transfer_card import card_for, claimed_name
 from transfer_detector import State
 
@@ -173,3 +173,24 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(card['whatsapp_contact_name'], 'Saved Demo')
         self.assertEqual(card['whatsapp_push_name'], 'Push Demo')
         self.assertIn('Saved Demo (claims to be Tunde)', format_alert(card))
+
+
+class CleanupAlertTests(unittest.TestCase):
+    def test_owner_required(self):
+        self.assertEqual(cleanup_intake_alert_tombstones()['code'], 'owner_auth_required')
+
+    def test_default_preview_and_explicit_apply(self):
+        with patch('intake_alerts._owner_alert', return_value={'success': True}) as call:
+            self.assertTrue(cleanup_intake_alert_tombstones()['success'])
+            call.assert_called_once_with('POST', 'intake-alerts/cleanup', {'dry_run': True})
+            cleanup_intake_alert_tombstones('2026-11-22T00:00:00+01:00', False)
+            call.assert_called_with('POST', 'intake-alerts/cleanup',
+                                   {'since': '2026-11-22T00:00:00+01:00', 'dry_run': False})
+
+    def test_invalid_inputs_never_dispatch(self):
+        with patch('intake_alerts._owner_alert') as call:
+            for since in ('2026-11-22', 'yesterday', '', 42):
+                self.assertEqual(cleanup_intake_alert_tombstones(since)['code'], 'invalid_since')
+            for dry_run in ('false', 0, None):
+                self.assertEqual(cleanup_intake_alert_tombstones(dry_run=dry_run)['code'], 'invalid_dry_run')
+            call.assert_not_called()

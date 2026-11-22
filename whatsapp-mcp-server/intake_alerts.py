@@ -162,7 +162,8 @@ def _owner_alert(method, path, body=None, params=None):
 def delete_intake_alert(event_id: str, reason: str = 'approved') -> dict:
     """Owner-only delete all live alerts for this event's request. No payment approval.
 
-    Returns message IDs, deleted_at and delete_mode (everyone or me). reason is
+    Returns message IDs, deleted_at and delete_mode (revoke+delete_for_me or
+    delete_for_me_only). reason is
     a short workflow label such as approved, rejected, edited or withdrawn.
     Failed deletes remain live and may be explicitly retried with this tool.
     """
@@ -178,3 +179,28 @@ def list_intake_alerts(event_id: str) -> dict:
     if not isinstance(event_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', event_id):
         return {'success': False, 'code': 'invalid_event_id'}
     return _owner_alert('GET', 'intake-alerts', params={'event_id': event_id})
+
+
+def cleanup_intake_alert_tombstones(since: str | None = None, dry_run: bool = True) -> dict:
+    """Owner-only delete-for-me cleanup of deleted/revoked ledger alerts in self-chat.
+
+    Defaults to dry-run: returns count and eligible rows without WhatsApp changes.
+    since filters alert sent_at inclusively, as an ISO timestamp with timezone.
+    Completed rows are skipped on retries. No non-ledger messages are touched.
+    WhatsApp acknowledgment does not prove phone/linked-device UI synchronization.
+    """
+    from datetime import datetime
+    if not isinstance(dry_run, bool):
+        return {'success': False, 'code': 'invalid_dry_run'}
+    body = {'dry_run': dry_run}
+    if since is not None:
+        try:
+            if not isinstance(since, str):
+                raise ValueError('invalid_since')
+            parsed = datetime.fromisoformat(since.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('timezone_required')
+            body['since'] = parsed.isoformat()
+        except ValueError:
+            return {'success': False, 'code': 'invalid_since'}
+    return _owner_alert('POST', 'intake-alerts/cleanup', body)

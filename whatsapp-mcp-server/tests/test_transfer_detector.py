@@ -258,9 +258,9 @@ class SplitBillTests(unittest.TestCase):
         # A wider configured window pairs the same fragments.
         result=classify(late[1],late,link_window=1800,exclusions=self.exclusions)
         self.assertEqual(result['amount_candidates'][0]['amount'],'51500')
-        # A real request keeps the wider conversation window.
+        # An older request cannot extend the destination's amount-link window.
         rows=[chef(1,'Please send money for the generator repair',minutes_ago=60),chef(2,ACCOUNT_UBA,minutes_ago=40),chef(3,'Total= 51,500')]
-        self.assertEqual(self.run_chat(rows)[2]['anchor_message_id'],'synthetic-chef-1')
+        self.assertIsNone(self.run_chat(rows)[2])
     def test_split_negatives_stay_negative(self):
         for text in ['OTP 123456 do not share\nTotal= 51,500','Payment successful\nTotal= 51,500']:
             self.assertIsNone(classify(chef(2,text),[chef(1,ACCOUNT_UBA,minutes_ago=1)],exclusions=self.exclusions),text)
@@ -458,6 +458,140 @@ class RuntimeTests(unittest.TestCase):
         self.detector.initialize()
         self.state.set(go_live=(NOW-timedelta(seconds=1)).isoformat())
     def add(self,row):self.bridge.messages.append(row);self.bridge.context.append(row)
+    def queued_payloads(self):
+        with self.state.db() as db:
+            return [json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox WHERE payload IS NOT NULL ORDER BY rowid')]
+
+    def test_completed_request_amount_is_not_borrowed_by_repeated_account(self):
+        for later in ('Please send to 0123456789 Wema Demo', 'Account: 0123456789 Wema bank'):
+            with self.subTest(kind='request' if later.startswith('Please') else 'details'):
+                self.setUp()
+                self.add(message(1, '0123456789 Wema / Demo 4k'))
+                self.detector.drain()
+                initial = self.queued_payloads()[0]
+                self.add(message(2, later, timestamp=(NOW+timedelta(minutes=3)).isoformat()))
+                self.detector.drain()
+                first, second = self.queued_payloads()
+                self.assertEqual(first, initial)
+                self.assertNotEqual(first['request_key'], second['request_key'])
+                self.assertIsNone(second['card']['amount'])
+                self.assertEqual(second['candidate']['amount_candidates'], [])
+                self.assertNotIn('message-1', second['candidate']['source_message_ids'])
+
+    def test_later_amount_updates_same_request_revision_two(self):
+        for fragment in ('test 6, 6k', 'Please send 6k'):
+            with self.subTest(kind='label' if fragment.startswith('test') else 'request'):
+                self.setUp()
+                self.add(message(1, 'Account: 0123456789 Wema bank'))
+                self.detector.drain()
+                initial = self.queued_payloads()[0]
+                self.assertIsNone(initial['card']['amount'])
+                self.add(message(2, fragment, timestamp=(NOW+timedelta(seconds=12)).isoformat()))
+                self.detector.drain()
+                first, updated = self.queued_payloads()
+                self.assertEqual({first['request_key'], updated['request_key']}, {initial['request_key']})
+                self.assertEqual(first['event_type'], 'transfer_request_candidate')
+                self.assertEqual(updated['event_type'], 'candidate_updated')
+                self.assertEqual(updated['revision'], 2)
+                self.assertEqual(updated['previous_event_id'], first['event_id'])
+                self.assertEqual(updated['changed_fields'], ['amount'])
+                self.assertEqual(updated['card']['amount']['value'], '6000')
+
+    def test_consumed_amount_fragment_survives_delivery_restart_and_same_account(self):
+        self.add(message(1, '6k'))
+        self.add(message(2, 'Account: 0123456789 Wema bank', timestamp=(NOW+timedelta(seconds=12)).isoformat()))
+        self.detector.drain()
+        first = self.queued_payloads()[0]
+        self.assertEqual(first['card']['amount']['value'], '6000')
+        self.assertTrue(self.detector.deliver_one())
+        self.state = State(self.directory.name)
+        self.detector = Detector(self.state, self.bridge, self.hook, 'synthetic-instance', '15550000001')
+        self.detector.initialize()
+        self.bridge.context = [self.bridge.context[0]]
+        self.add(message(3, 'Account: 0123456789 Wema bank', timestamp=(NOW+timedelta(seconds=24)).isoformat()))
+        self.detector.drain()
+        second, = self.queued_payloads()
+        self.assertIsNone(second['card']['amount'])
+        self.assertNotEqual(first['request_key'], second['request_key'])
+
+    def test_later_amount_outside_window_does_not_update_account(self):
+        for details in ('Account: 0123456789 Wema bank', 'Please send to 0123456789 Wema'):
+            with self.subTest(kind='details' if details.startswith('Account') else 'request'):
+                self.setUp()
+                self.add(message(1, details))
+                self.add(message(2, 'test 6, 6k', timestamp=(NOW+timedelta(seconds=901)).isoformat()))
+                self.detector.drain()
+                first, = self.queued_payloads()
+                self.assertIsNone(first['card']['amount'])
+
+    def test_second_account_does_not_steal_first_accounts_amount_fragment(self):
+        self.add(message(1, 'Account: 0123456789 Wema bank'))
+        self.add(message(2, 'test 6, 6k', timestamp=(NOW+timedelta(seconds=12)).isoformat()))
+        self.add(message(3, 'Account: 0987654321 Wema bank', timestamp=(NOW+timedelta(seconds=24)).isoformat()))
+        self.detector.drain()
+        first, updated, second = self.queued_payloads()
+        self.assertEqual(updated['request_key'], first['request_key'])
+        self.assertEqual(updated['card']['amount']['value'], '6000')
+        self.assertNotEqual(second['request_key'], first['request_key'])
+        self.assertIsNone(second['card']['amount'])
+        self.assertEqual(second['card']['account_number'], '0987654321')
+
+    def test_earlier_amount_outside_window_remains_unattached(self):
+        self.add(message(1, '6k'))
+        self.add(message(2, 'Account: 0123456789 Wema bank', timestamp=(NOW+timedelta(seconds=901)).isoformat()))
+        self.detector.drain()
+        candidate, = self.queued_payloads()
+        self.assertIsNone(candidate['card']['amount'])
+        self.assertTrue(candidate['candidate']['amount_missing'])
+
+    def test_later_amount_fragment_stays_consumed_when_destination_context_is_missing(self):
+        self.add(message(1, 'Account: 0123456789 Wema bank'))
+        self.add(message(2, 'test 6, 6k', timestamp=(NOW+timedelta(seconds=12)).isoformat()))
+        self.detector.drain()
+        while self.detector.deliver_one():pass
+        self.state = State(self.directory.name)
+        self.detector.state = self.state
+        self.bridge.context = [self.bridge.context[-1]]
+        self.add(message(3, 'Account: 0987654321 Wema bank', timestamp=(NOW+timedelta(seconds=24)).isoformat()))
+        self.detector.drain()
+        candidate, = self.queued_payloads()
+        self.assertIsNone(candidate['card']['amount'])
+        self.assertTrue(candidate['candidate']['amount_missing'])
+
+    def test_amount_ownership_is_checked_atomically_before_cursor_advances(self):
+        amount = message(1, '6k')
+        first = message(2, 'Account: 0123456789 Wema bank', timestamp=(NOW+timedelta(seconds=12)).isoformat())
+        second = message(3, 'Account: 0987654321 Wema bank', timestamp=(NOW+timedelta(seconds=24)).isoformat())
+        self.bridge.context = [amount]
+        key_a, hash_a, payload_a = self.detector.build(first)
+        key_b, hash_b, payload_b = self.detector.build(second)
+        self.state.consume(2, key_a, hash_a, payload_a)
+        with self.assertRaisesRegex(RuntimeError, '^amount_fragment_already_consumed$'):
+            self.state.consume(3, key_b, hash_b, payload_b)
+        self.assertEqual(self.state.get('cursor'), 2)
+        self.assertEqual(len(self.queued_payloads()), 1)
+        # Retrying classification sees the committed owner and leaves amount null.
+        _, _, rebuilt = self.detector.build(second)
+        self.assertIsNone(rebuilt['card']['amount'])
+
+    def test_legacy_retained_payload_backfills_amount_fragment_ownership(self):
+        self.add(message(1, '6k'))
+        self.add(message(2, 'Account: 0123456789 Wema bank', timestamp=(NOW+timedelta(seconds=12)).isoformat()))
+        self.detector.drain()
+        original = self.queued_payloads()
+        with self.state.db() as db:
+            db.execute('DROP TABLE message_requests')
+            db.execute('ALTER TABLE requests_latest DROP COLUMN revision')
+        self.state = State(self.directory.name)
+        self.detector.state = self.state
+        self.assertEqual(self.queued_payloads(), original)
+        while self.detector.deliver_one():pass
+        self.bridge.context = [self.bridge.context[0]]
+        self.add(message(3, 'Account: 0987654321 Wema bank', timestamp=(NOW+timedelta(seconds=24)).isoformat()))
+        self.detector.drain()
+        candidate, = self.queued_payloads()
+        self.assertIsNone(candidate['card']['amount'])
+
     def test_new_event_restart_replay_edit_and_successful_context_erasure(self):
         self.add(message());self.detector.drain();queued=self.state.due()
         self.assertEqual(self.state.status()['queued_notifications'],1)
@@ -553,12 +687,14 @@ class RuntimeTests(unittest.TestCase):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,ACCOUNT_UBA,minutes_ago=1));self.detector.drain()
         initial=self.state.due()[1]
+        self.assertEqual(initial['revision'],1)
         self.assertTrue(initial['candidate']['amount_missing'])
         self.assertTrue(self.detector.deliver_one())
         restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
         restarted.initialize()
         self.add(chef(2,KITCHEN));restarted.drain()
         payload=self.state.due()[1]
+        self.assertEqual(payload['revision'],2)
         self.assertEqual(payload['event_type'],'candidate_updated')
         self.assertEqual(payload['previous_event_id'],initial['event_id'])
         self.assertEqual(payload['request_key'],initial['request_key'])

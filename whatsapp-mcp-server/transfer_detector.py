@@ -100,6 +100,13 @@ class State:
                 CREATE TABLE IF NOT EXISTS name_enquiries(event_id TEXT PRIMARY KEY,payload TEXT,status TEXT NOT NULL DEFAULT 'pending');''')
             if 'card' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
                 db.execute('ALTER TABLE requests_latest ADD COLUMN card TEXT')
+            if 'revision' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
+                db.execute('ALTER TABLE requests_latest ADD COLUMN revision INTEGER NOT NULL DEFAULT 1')
+            db.execute('CREATE TABLE IF NOT EXISTS message_requests(source TEXT PRIMARY KEY,request_key TEXT NOT NULL)')
+            # Retained legacy payloads can establish ownership without storing text or accounts.
+            for body, in db.execute('SELECT payload FROM outbox WHERE payload IS NOT NULL AND request_key IS NOT NULL ORDER BY rowid'):
+                value=json.loads(body)
+                self._own_messages(db,value)
             for key,event_id,body in db.execute('SELECT request_key,id,payload FROM outbox WHERE request_key IS NOT NULL AND payload IS NOT NULL ORDER BY rowid'):
                 value=json.loads(body)
                 chat=(value.get('source') or {}).get('chat_jid')
@@ -129,6 +136,17 @@ class State:
     def seen(self,source):
         with self.lock,self.db() as db:
             return db.execute('SELECT digest,event FROM seen WHERE source=?',(source,)).fetchone()
+    @staticmethod
+    def _own_messages(db,payload):
+        source=payload.get('source',{})
+        for message_id in payload.get('candidate',{}).get('source_message_ids',[]):
+            key=digest(payload.get('source_instance'),source.get('chat_jid'),message_id)
+            db.execute('INSERT OR IGNORE INTO message_requests VALUES(?,?)',(key,payload['request_key']))
+    def consumed_messages(self,account,chat,rows):
+        with self.lock,self.db() as db:
+            return {row['id'] for row in rows if
+                    db.execute('SELECT 1 FROM message_requests WHERE source=?',(digest(account,chat,row['id']),)).fetchone() or
+                    db.execute('SELECT 1 FROM seen WHERE source=?',(digest(account,chat,row['id']),)).fetchone()}
     def _queue(self,db,source,payload):
         test_event=int(is_test_event(payload))
         payload=bounded_notification(payload)
@@ -159,13 +177,21 @@ class State:
                         db.execute('DELETE FROM outbox WHERE id=? AND delivered IS NULL AND first_attempt IS NULL',(previous,))
                         if self.events is not None:self.events.cancel_pending(db,[previous])
                 if request_key and not payload.get('candidate_withdrawn'):
-                    previous=db.execute('SELECT event_id,card FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
+                    # Recheck ownership in the write transaction: another worker may
+                    # have attached a fragment after this payload was built.
+                    for amount in payload.get('candidate',{}).get('amount_candidates',[]):
+                        message_source=digest(payload.get('source_instance'),payload['source']['chat_jid'],amount['source_message_id'])
+                        owner=db.execute('SELECT request_key FROM message_requests WHERE source=?',(message_source,)).fetchone()
+                        if owner and owner[0]!=request_key:raise RuntimeError('amount_fragment_already_consumed')
+                    previous=db.execute('SELECT event_id,card,revision FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
+                    payload['revision']=previous[2]+int(previous[0]!=payload['event_id']) if previous else 1
                     if previous and previous[0]!=payload['event_id']:
                         old_card=json.loads(previous[1]) if previous[1] else {}
                         new_card=payload.get('card',{})
                         payload.update(event_type='candidate_updated',previous_event_id=previous[0],revision_hint='replace_card_for_request_key',
                             changed_fields=sorted(k for k in old_card.keys()|new_card.keys() if old_card.get(k)!=new_card.get(k)))
-                    db.execute('INSERT OR REPLACE INTO requests_latest VALUES(?,?,?,1,?)',(request_key,payload['event_id'],payload['source']['chat_jid'],json.dumps(payload.get('card',{}))))
+                    db.execute('INSERT OR REPLACE INTO requests_latest(request_key,event_id,chat_jid,active,card,revision) VALUES(?,?,?,1,?,?)',(request_key,payload['event_id'],payload['source']['chat_jid'],json.dumps(payload.get('card',{})),payload['revision']))
+                    self._own_messages(db,payload)
                 payload=self._queue(db,source,payload)
                 if payload.get('card',{}).get('account_name_reason')=='pending_nonblocking':
                     db.execute('INSERT OR IGNORE INTO name_enquiries(event_id,payload) VALUES(?,?)',(payload['event_id'],json.dumps(payload)))
@@ -175,11 +201,12 @@ class State:
     def enriched(self,payload,original):
         with self.lock,self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            latest=db.execute('SELECT event_id FROM requests_latest WHERE request_key=? AND active=1',(payload['request_key'],)).fetchone()
+            latest=db.execute('SELECT event_id,revision FROM requests_latest WHERE request_key=? AND active=1',(payload['request_key'],)).fetchone()
             # Do not resurrect withdrawn requests or replace a newer amount/destination revision.
             if not latest or latest[0]!=original:return
+            payload['revision']=latest[1]+1
             self._queue(db,'name_enquiry',payload)
-            db.execute('UPDATE requests_latest SET event_id=?,card=? WHERE request_key=?',(payload['event_id'],json.dumps(payload.get('card',{})),payload['request_key']))
+            db.execute('UPDATE requests_latest SET event_id=?,card=?,revision=? WHERE request_key=?',(payload['event_id'],json.dumps(payload.get('card',{})),payload['revision'],payload['request_key']))
     def cancel_held(self,chat_jid):
         """Cancel unsent candidates and emit one withdrawal per active request, atomically."""
         with self.lock,self.db() as db:
@@ -366,7 +393,8 @@ class Detector:
             except (ValueError,TypeError,KeyError):continue
         rows.sort(key=lambda x:(parsed_time(x['timestamp']),x['id']))
         rows=rows[-20:]
-        clues=classify(row,rows,dry_run,self.link_window,self.exclusions)
+        consumed=self.state.consumed_messages(self.account,row['chat_jid'],rows)
+        clues=classify(row,rows,dry_run,self.link_window,self.exclusions,consumed)
         if not clues:return skip()
         cleaned,truncated=safe_context(rows)
         base['source']['content']=(row.get('content') or '')[:2000]

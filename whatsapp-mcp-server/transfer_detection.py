@@ -227,8 +227,8 @@ def non_request(text):
 def request_language(text):
     return bool(not non_request(text) and ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
 
-def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
-    """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded).
+def linked_amount(source,ordered,accounts,skip_id,window,exclusions,consumed=()):
+    """Earlier unconsumed amount-only evidence: (amounts, from_excluded).
 
     A standalone bare total ("395,000") is preferred over a nearer list of
     several line-item amounts, the vendor quote -> total -> account pattern.
@@ -241,10 +241,11 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
         elapsed=age(source,row)
         if elapsed is None:continue
         if elapsed>window:break
+        if row['id'] in consumed:break
         body=row.get('content') or ''
         row_accounts=account_clues(body)
-        # Stop at another destination; its amount is not ours.
-        if row_accounts and set(row_accounts)!=set(accounts):break
+        # Even a repeated destination begins a separate request.
+        if row_accounts:break
         bare=bare_amount(body)
         found=amount_clues(body) or bare
         if not found:continue
@@ -264,7 +265,7 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     if nearest_bare:return ([],False) if len(bare_values)>1 else (nearest_bare,False)
     return fallback,False
 
-def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=()):
+def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=(),consumed=()):
     """Return evidence for a possible request; false positives need bot/owner review."""
     text=source.get('content') or ''
     if sensitive(text) or (SYNTHETIC.search(text) and not dry_run) or RECEIPT.search(text):return None
@@ -310,14 +311,14 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if accounts and not amounts:
         # Split bill: the amount arrived in an earlier incoming message of the
         # same chat within the link window.
-        found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions)
+        found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions,consumed)
         if from_excluded:return None
         amounts=found or []
     if previous and not amounts:amounts=bare_amount(text,strict=False)
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []
-    if previous and previous_accounts and not request_language(previous.get('content','')) and not direct:
+    if previous and previous_accounts and not request_language(previous.get('content','')) and (not direct or (amounts and not accounts)):
         # A split account/bank pair can itself follow the original request.
         # Walk back only until a different destination or the request anchor.
         for older in prior[prior.index(previous)+1:]:
@@ -326,15 +327,16 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             if request_language(older.get('content','')):
                 anchor=older['id'];break
     different_destination=bool(accounts and previous_accounts and set(accounts)!=set(previous_accounts))
-    if different_destination:anchor=account_source
+    if accounts and previous_accounts and account_source==source.get('id'):anchor=account_source
     anchor_row=next((x for x in prior if x['id']==anchor),None)
     # Amount <-> bare destination pairing uses the short link window; an
     # established request keeps the wider conversation window.
-    requested=bool(anchor_row and request_language(anchor_row.get('content','')))
+    requested=bool(anchor_row and request_language(anchor_row.get('content','')) and not account_clues(anchor_row.get('content','')))
     elapsed=age(source,previous) if previous else None
-    follow_up=bool(amounts and previous and (requested or (elapsed is not None and elapsed<=window)))
+    follow_up=bool(amounts and previous and ((requested and not previous_accounts) or (elapsed is not None and elapsed<=window)))
     if follow_up and not accounts and previous_accounts:
         accounts=previous_accounts;account_source=previous['id']
+        if anchor==source.get('id'):anchor=previous['id']
     reasons=[]
     if accounts and (has_bank(text) or previous or any(has_bank(x.get('content','')) for x in prior[:3])):reasons.append('payment_details_with_context')
     if direct:reasons.append('request_language_with_money_or_amount')
@@ -363,7 +365,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             'beneficiary_verified':False,
             'amount_ambiguous':len({(x['amount'],x['currency_hint']) for x in amounts})>1,
             'different_destination_from_previous':different_destination,
-            'amount_missing':not amounts and not any(amount_clues(x.get('content','')) for x in linked_prior),
+            'amount_missing':not amounts,
             'attachment_extraction_needed':source.get('media_type') in ('image','document')}
 
 def digest(*values):

@@ -28,13 +28,16 @@ func protectBridgeAccess(next http.Handler, lookups ...recipientLookup) http.Han
 		}
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		readToken := os.Getenv("WHATSAPP_BRIDGE_READ_TOKEN")
+		alertRoute := r.URL.Path == "/api/intake-alerts" || r.URL.Path == "/api/intake-alerts/delete" || (r.Method == http.MethodGet && r.URL.Path == "/api/identity")
+		alertToken := os.Getenv("INTAKE_SELF_ALERT_TOKEN")
+		alertAccess := alertRoute && len(alertToken) >= 32 && subtle.ConstantTimeCompare([]byte(provided), []byte(alertToken)) == 1
 		fullAccess := subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 		readAccess := len(readToken) >= 32 && subtle.ConstantTimeCompare([]byte(provided), []byte(readToken)) == 1
-		if len(r.Header.Values("Authorization")) != 1 || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || (!fullAccess && !readAccess) {
+		if len(r.Header.Values("Authorization")) != 1 || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || (!fullAccess && !readAccess && !alertAccess) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if !fullAccess && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if !fullAccess && !alertAccess && r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "Read-only credential", http.StatusForbidden)
 			return
 		}
@@ -76,7 +79,7 @@ func protectBridgeAccess(next http.Handler, lookups ...recipientLookup) http.Han
 			http.Error(w, "Contact changes disabled in saved-contact sending mode", http.StatusForbidden)
 			return
 		} else if r.Method != http.MethodGet && r.Method != http.MethodHead &&
-			r.URL.Path != "/api/download" && r.URL.Path != "/api/contacts/is-on-whatsapp" &&
+			r.URL.Path != "/api/intake-alerts" && r.URL.Path != "/api/intake-alerts/delete" && !alertAccess && r.URL.Path != "/api/download" && r.URL.Path != "/api/contacts/is-on-whatsapp" &&
 			!strings.EqualFold(os.Getenv("WHATSAPP_MUTATIONS_ENABLED"), "true") {
 			http.Error(w, "Mutations disabled", http.StatusForbidden)
 			return

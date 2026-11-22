@@ -96,6 +96,8 @@ class State:
             if 'request_key' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN request_key TEXT')
             if 'held' not in columns:db.execute('ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0')
             migrate(db)
+            import intake_alerts
+            intake_alerts.migrate(db)
             db.executescript('''CREATE TABLE IF NOT EXISTS requests_latest(request_key TEXT PRIMARY KEY,event_id TEXT NOT NULL,chat_jid TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS name_enquiries(event_id TEXT PRIMARY KEY,payload TEXT,status TEXT NOT NULL DEFAULT 'pending');''')
             if 'card' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
@@ -158,6 +160,8 @@ class State:
             (payload['event_id'],source,json.dumps(payload),utcnow(),payload.get('detector_observed_at'),payload.get('detector_processing_ms'),payload.get('request_key'),
              milliseconds(payload.get('source',{}).get('timestamp')) if payload.get('source',{}).get('timestamp') else None,
              payload.get('ingested_at'),payload.get('sse_wake_at'),milliseconds(payload.get('detector_observed_at')) if payload.get('detector_observed_at') else None,payload.get('detector_processing_ms'),test_event))
+        import intake_alerts
+        intake_alerts.queue(db,payload)
         if self.events is not None:self.events.publish(db,payload,0)
         return payload
     def consume(self,sequence,source,body_digest,payload,hold_until=0):
@@ -549,11 +553,16 @@ def main():
     if os.environ.get('WHATSAPP_TRANSFER_NAME_ENQUIRY_URL'):
         enquiry=NameEnquiry(state,os.environ['WHATSAPP_TRANSFER_NAME_ENQUIRY_URL'])
         threading.Thread(target=enquiry.run,daemon=True).start()
+    import intake_alerts
+    alerts = intake_alerts.AlertWorker(state, intake_alerts.AlertClient()) if intake_alerts.enabled() else None
+    alert_thread = threading.Thread(target=alerts.run, name='intake-self-alert') if alerts else None
+    if alert_thread:alert_thread.start()
     server=status_server(state,token)
     for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,lambda *_:(detector.stop.set(),detector.wake.set()))
     try:detector.run()
     finally:
         if enquiry:enquiry.stop.set()
+        if alerts:alerts.stop.set();alert_thread.join(timeout=30)
         server.shutdown();server.server_close()
 
 if __name__=='__main__':main()

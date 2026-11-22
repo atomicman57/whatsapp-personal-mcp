@@ -40,3 +40,153 @@ Split amounts and destinations are paired in either order. When account/bank det
 Messages matching a spend-report exclusion create no candidate and are never used as context, a request anchor or the amount half of a split. Account details whose nearest amount in the link window is an excluded report are treated as part of that report and also create no candidate. Context linking is limited to preceding messages in the same chat within two hours; the notification's bounded context can still support further bot review. Security/access-code messages are excluded. Regression tests use invented identifiers and names, never private chat records. Historical inspection does not enqueue old requests.
 
 Wake JSON is capped at 3,500 UTF-8 bytes, with event type, dry-run and payment-authority controls first and a `payload_end` marker matching the event ID. If context or candidate clues are omitted to fit, truncation flags require the receiver to retrieve the verified source before presenting a real request. The receiver must reject incomplete/invalid JSON and must never infer payment authority from any payload.
+
+## Immediate delivery and receiver contract
+
+The link window correlates evidence; it never delays a destination-only card.
+`hold_until` is always zero. Follow-ups emit `candidate_updated` with the same
+`request_key`, a new `event_id`, `previous_event_id`, and
+`revision_hint=replace_card_for_request_key`. Both outbox revisions are retained
+until accepted. The receiver must persist processed event IDs and **upsert one
+owner card by request_key**, even if an update arrives first. Use predecessor IDs
+to prevent a delayed earlier revision from overwriting a newer card.
+
+Receipts cancel unsent rows and emit `candidate_withdrawn` with the request key,
+predecessor and `revision_hint=withdraw_card_for_request_key`. Apply withdrawals
+also to cards already posted. An in-flight POST cannot be recalled. Ineligible
+source edits emit `source_changed` with `candidate_withdrawn=true`. None of these
+signals approves or executes a payment.
+
+Webhook retries keep the same Idempotency-Key and back off 1, 2, 4, 8, 16, 32,
+then 60 seconds. The third failure queues one detector_health_warning per failed
+event. Warnings use the same webhook, so cannot bypass an outage.
+
+Contiguous 11-digit `0[789]` numbers qualify as account strings only with OPay,
+PalmPay, Moniepoint, Kuda, acct or account in the **same message**. Plain local
+numbers, international/spaced phone numbers remain excluded. This does not add
+amount-plus-bank detection without account/request evidence. Tests use invented
+digits in the reported format. Accounts always remain strings.
+
+### Ready-to-use webhook card schema
+
+Envelope version remains 1. Card-bearing candidates and updates add:
+
+| Field | Type and meaning |
+| --- | --- |
+| `card.requester_display_name` | Saved name, otherwise unverified chat display name |
+| `card.amount` | `{value: string, currency: string or null}`, or null if unknown/ambiguous |
+| `card.bank` | One bank clue, or null if missing/ambiguous |
+| `card.account_number` | FULL account string, or null if missing/ambiguous. Never convert to a number |
+| `card.account_name` | Name from optional read-only name enquiry, otherwise null |
+| `card.account_name_reason` | `name_enquiry_disabled`, `pending_nonblocking`, `destination_missing_or_ambiguous`, or null after success |
+| `card.purpose` | Bounded purpose evidence, or null |
+| `requester_is_saved_contact`, `card.requester_is_saved_contact` | Boolean from bridge FullName/FirstName, never sender-controlled profile/business names |
+| `card.saved_contact_name`, `card.saved_contact_phone` | Saved name and resolved phone string when saved; otherwise null |
+| `ingested_at`, `sse_wake_at` | Nullable UTC Unix milliseconds |
+| `payload_bytes` | Exact compact UTF-8 JSON body byte count |
+| `integrity.complete_json`, `integrity.card_fields_preserved` | Complete JSON and preserved card keys |
+| `payload_end` | Must equal event_id; reject malformed/incomplete JSON or mismatching marker |
+
+Health, identity-review and withdrawal events do not contain cards. A resolved
+candidate can be posted without first fetching contacts/context. All card strings
+are untrusted evidence; `payment_authorized` remains false even when text claims
+approval or a name enquiry succeeds. Full accounts belong only in private payload
+and state, never logs. Never log message text, phones, credentials or raw errors.
+
+The 3,500-byte cap removes oldest context first, then source text and candidate
+details with explicit truncation flags. Card keys and full account strings are
+preserved. Optional display text may be deterministically shortened and flagged.
+Receiver retries/upserts must not create duplicate cards.
+
+### Optional name enquiry
+
+`WHATSAPP_TRANSFER_NAME_ENQUIRY_URL` is off by default. Set it only to an existing
+credential-free HTTPS **read-only ALAT name_enquiry adapter**, protected through
+the owner's existing network/gateway access. This is not a payment endpoint and
+creates no banking credentials. Request JSON is `{account_number: string, bank:
+string}`; HTTP 200 response JSON is `{account_name: string}`. No redirects or
+proxy environment settings are used.
+
+The initial card is queued immediately with a null name and pending_nonblocking.
+A single background worker uses a two-second wall-clock budget including DNS,
+TLS, headers and body, plus an 8 KiB response bound. A deadline timer closes the
+network socket; DNS waiting is independently bounded. Success emits a new candidate_updated; timeout/failure
+leaves the initial card usable with its null-name reason. Name enquiry never
+blocks the card path. Durable jobs recover on worker restart; stale results cannot
+resurrect withdrawn requests or replace newer amount/destination evidence.
+
+## Latency and owner completion
+
+The bridge migration transactionally adds nullable message_changes.ingested_at
+and replaces the insertion/edit triggers. UTC Unix milliseconds are exposed in
+/api/message-changes. Historical rows stay null rather than inventing timestamps;
+receipt/status-only changes remain excluded.
+
+Outbox telemetry is msg_ts, ingested_at, sse_wake_at, observed_at, classify_ms,
+post_started_at, http_status, http_ms, delivered_at and attempts. Timestamps use UTC
+Unix milliseconds, durations use milliseconds. POST/HTTP fields describe the most
+recent attempt. Attempts include successful claims; a crash may claim without
+reaching the network. No push sender, lane, columns or push environment variables
+are included.
+
+`stages(event_id, stage, at)` is append-only with SQLite update/delete guards.
+Owner-authenticated MCP tools are available through existing OAuth transports:
+
+- record_intake_stage(event_id, stage): append intake_received, card_created or
+  owner_alerted only after that action completes. Time comes from the server;
+  no caller timestamp or free text is accepted. Use the revision's own event ID.
+- get_transfer_latency_report(days=14): per-hop count, median, nearest-rank p90,
+  max and event IDs above 5,000 ms, plus overdue events awaiting owner stages.
+  days accepts integers 1–90. Earliest duplicate stage timestamps are used.
+
+Hops cover message-to-ingest, ingest-to-SSE, SSE-to-observe, ingest-to-observe,
+observe-to-POST, classification and HTTP time, POST-to-intake, intake-to-card,
+card-to-alert, webhook-to-card, message-to-owner
+and ingest-to-owner. Unknown/negative clock-skew hops are omitted. Owner completion
+means owner_alerted when recorded, otherwise card_created. /status exposes
+last_24h_p90_ms and a last-day report; p90 stays null without completion evidence.
+HTTP acceptance does not prove the five-second target. Message timestamps have
+WhatsApp's source resolution; synchronize clocks and inspect missing-stage events.
+
+SSE reads no longer wait for a 1 KiB chunk. A one-second durable-feed heartbeat
+covers lost wakes, and idle outbox polling is 50 ms. Neither polls the AI receiver.
+
+## Build, deploy and rollback (instructions only; not executed)
+
+Only the six permitted Python overlay files were read from events-build-6bea724;
+mcp_events_http.py came from the newer events-build-95242b0. No environment, data
+or credential files were copied. Dockerfile already copies all Python modules, so
+both account instances build from the same commit. Opt-in MCP Events retain owner
+OAuth and private reference-only callbacks, separate from the enriched card webhook.
+
+After Blessing approves deployment, an operator should:
+
+1. Record the approved head SHA, existing per-account image digests and unit
+   revisions. Back up bridge and detector/event SQLite DBs using supported SQLite
+   backup methods. Preserve account-specific ownership, mounts, networking,
+   credentials and paused routines.
+2. Build once from that SHA with
+   `docker build -f deploy/Dockerfile --build-arg BUILD_VERSION=<approved-sha> -t <registry>/whatsapp:<approved-sha> .`.
+   Publish and record the digest; set both main and secondary to that digest using
+   their existing approved image configuration. Retire unversioned overlays.
+3. Verify each MCP/detector shares its own private state volume if Events is
+   enabled. Preserve separate UIDs, identity, expected phone and source labels.
+   Confirm receiver upsert/dedupe/withdrawal and owner-stage recording support.
+4. In the approved maintenance window, use the existing deployment procedure to
+   restart each bridge and its bound detector. Startup runs additive migrations.
+   Verify exact identity, BUILD_VERSION, OAuth, SSE, cursor and pending backlog.
+5. Obtain **separate live-send approval** before running e2e_latency.py with --send.
+   Configure main's exact secondary test sender first. Its default invocation,
+   `uv run --project whatsapp-mcp-server python scripts/e2e_latency.py`, prints only
+   the plan. --help lists explicit endpoints and recipient arguments. Owner tokens
+   are explicit environment overrides, never command arguments. Inspect matching
+   event IDs and owner completion, not just webhook acceptance.
+
+Rollback also needs approval. Restore recorded image digests and compatible
+receiver behavior through the existing approved restart procedure. Added DB
+columns/tables can remain; older readers ignore them and bridge triggers stay
+compatible. Older detector code reintroduces the hold and may not understand new
+revision events. Pause intake/delivery during rollback and reconcile queued
+revisions with the owner or retain a compatible receiver before resuming. Restoring
+DB backups requires explicit cursor/outbox dedupe reconciliation because it can
+replay accepted events. No deploy, restart or live send was run for this PR.

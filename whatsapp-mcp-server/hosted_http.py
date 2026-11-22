@@ -8,7 +8,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 
 class HostedApp:
-    def __init__(self, app, public_url, token, oauth=False, media=None):
+    def __init__(self, app, public_url, token, oauth=False, media=None, events=None):
         url = urlsplit(public_url)
         if (url.scheme != "https" or not url.hostname or url.username or url.password
                 or url.path not in ("", "/") or url.query or url.fragment
@@ -22,6 +22,7 @@ class HostedApp:
         self.origin = public_url.rstrip("/")
         self.oauth = oauth
         self.media = media
+        self.events = events
         self.oauth_paths = {
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-protected-resource/mcp",
@@ -98,6 +99,18 @@ class HostedApp:
                 break
         delivered = False
 
+        if (mcp_path and scope.get('method') == 'POST' and self.events is not None
+                and self.events.recognizes(bytes(body), values)):
+            import json
+            status, result = await self.events.handle(bytes(body), auth)
+            headers = [(b'content-type', b'application/json')]
+            if status == 401:
+                headers.append((b'www-authenticate', ('Bearer resource_metadata="' + self.origin
+                    + '/.well-known/oauth-protected-resource/mcp"').encode()))
+            await send({'type': 'http.response.start', 'status': status, 'headers': headers})
+            await send({'type': 'http.response.body', 'body': json.dumps(result).encode()})
+            return
+
         # SDK 1.28's revocation model declares Optional[str] without a default,
         # making the otherwise optional public-client secret a required field.
         # Supply an empty value only when absent. The SDK still authenticates
@@ -135,8 +148,26 @@ def run_hosted_http(mcp, port):
         enable_dns_rebinding_protection=True, allowed_hosts=sorted(app.hosts), allowed_origins=[])
     # Configure before constructing the SDK's lazily cached session manager.
     app.app = mcp.streamable_http_app()
+    broker = None
+    if os.environ.get('WHATSAPP_MCP_EVENTS_ENABLED', '').lower() == 'true':
+        from mcp_events import EventStore, EventBroker
+        from mcp_events_http import EventRPC
+        import threading
+        provider = getattr(mcp, 'whatsapp_oauth_provider', None)
+        if not oauth or provider is None:
+            raise ValueError('Events require owner-approved OAuth grants')
+        store = EventStore(os.environ['WHATSAPP_MCP_EVENTS_STATE_DIR'],
+                           os.environ['WHATSAPP_TRANSFER_SOURCE_ACCOUNT'], os.environ['WHATSAPP_BRIDGE_INSTANCE_ID'])
+        broker = EventBroker(store, provider.event_owner_active)
+        app.events = EventRPC(mcp, broker, provider)
     bind_host = os.environ.get("WHATSAPP_MCP_BIND_HOST", "127.0.0.1")
     if bind_host not in ("127.0.0.1", "0.0.0.0"):
         raise ValueError("Unsupported bind host")
-    uvicorn.run(app, host=bind_host, port=port, log_level="warning", access_log=False,
-                proxy_headers=False, limit_concurrency=32, timeout_keep_alive=5)
+    if broker is not None:
+        threading.Thread(target=broker.run, daemon=True).start()
+    try:
+        uvicorn.run(app, host=bind_host, port=port, log_level="warning", access_log=False,
+                    proxy_headers=False, limit_concurrency=32, timeout_keep_alive=5)
+    finally:
+        if broker is not None:
+            broker.stop.set()

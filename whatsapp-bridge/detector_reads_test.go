@@ -131,3 +131,54 @@ func TestDetectorReadRoutesValidateBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestChangeIngestMigrationAndUTCUnixMilliseconds(t *testing.T) {
+	s, err := NewMessageStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// Reproduce the pre-migration durable feed, preserving an unknown historic time.
+	_, err = s.db.Exec(`DROP TRIGGER messages_change_insert;
+ DROP TRIGGER messages_change_update;
+ DROP TABLE message_changes;
+ CREATE TABLE message_changes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,chat_jid TEXT NOT NULL,message_id TEXT NOT NULL);
+ INSERT INTO message_changes(chat_jid,message_id) VALUES('15550000001@s.whatsapp.net','old');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err = initMessageChanges(s.db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chat := "15550000001@s.whatsapp.net"
+	if err = s.StoreChat(chat, "Synthetic", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().UnixMilli()
+	put := func(content string) {
+		t.Helper()
+		if err = s.StoreMessage("new", chat, "15550000001", content, time.Unix(1000, 0), false, "", "", "", nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("Synthetic original")
+	put("Synthetic revision")
+	after := time.Now().UnixMilli()
+	page, err := s.changesAfter(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 3 {
+		t.Fatal("migration or triggers lost feed rows")
+	}
+	if page.Messages[0].IngestedAt != nil {
+		t.Fatal("historic ingest time fabricated")
+	}
+	for _, row := range page.Messages[1:] {
+		if row.IngestedAt == nil || *row.IngestedAt < before || *row.IngestedAt > after {
+			t.Fatal("invalid UTC millisecond ingestion timestamp")
+		}
+	}
+}

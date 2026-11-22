@@ -7,7 +7,7 @@ from macos_contacts import contacts_app_status as macos_contacts_app_status
 from direct_sending import send_message, send_file, send_audio_message
 from replies import reply_message
 from workflow_reads import export_chat, list_chat_state, get_message_status, get_contact_details, list_new_messages, download_profile_photo
-from transfer_detector_status import get_transfer_detection_status
+from transfer_detector_status import get_transfer_detection_status, record_intake_stage, get_transfer_latency_report
 from media_transfer import create_media_upload,get_media_download
 from transcription import transcribe_audio_file as whisper_transcribe_audio_file
 from transcription import whisper_status as get_whisper_status
@@ -41,6 +41,7 @@ if os.environ.get("WHATSAPP_MCP_OAUTH_ENABLED", "").lower() == "true":
     from owner_oauth import configure_oauth
     oauth_provider, oauth_settings = configure_oauth()
     mcp = FastMCP("whatsapp", auth_server_provider=oauth_provider, auth=oauth_settings)
+    mcp.whatsapp_oauth_provider = oauth_provider
 
     @mcp.custom_route("/owner/authorize", methods=["GET", "POST"])
     async def owner_authorization(request):
@@ -57,6 +58,8 @@ mcp.tool()(list_chat_state)
 mcp.tool()(get_message_status)
 mcp.tool()(get_contact_details)
 mcp.tool()(get_transfer_detection_status)
+mcp.tool()(record_intake_stage)
+mcp.tool()(get_transfer_latency_report)
 mcp.tool()(create_media_upload)
 mcp.tool()(get_media_download)
 mcp.tool()(list_new_messages)

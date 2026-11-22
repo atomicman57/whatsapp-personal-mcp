@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -15,19 +16,61 @@ import (
 // Durable keys, not duplicate message bodies. Re-syncs of identical messages and
 // receipt-only updates do not wake the detector. Bounded retention reports gaps.
 func initMessageChanges(db *sql.DB) error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS message_changes (
-		sequence INTEGER PRIMARY KEY AUTOINCREMENT, chat_jid TEXT NOT NULL, message_id TEXT NOT NULL);
-		CREATE TRIGGER IF NOT EXISTS messages_change_insert AFTER INSERT ON messages BEGIN
-		 INSERT INTO message_changes(chat_jid,message_id) VALUES(NEW.chat_jid,NEW.id);
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`CREATE TABLE IF NOT EXISTS message_changes (
+		sequence INTEGER PRIMARY KEY AUTOINCREMENT, chat_jid TEXT NOT NULL, message_id TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	rows, err := tx.Query("PRAGMA table_info(message_changes)")
+	if err != nil {
+		return err
+	}
+	hasIngested := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, kind string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &kind, &notnull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "ingested_at" {
+			hasIngested = true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	// Historical ingest times are unknown. Do not manufacture migration-time latency.
+	if !hasIngested {
+		if _, err = tx.Exec("ALTER TABLE message_changes ADD COLUMN ingested_at INTEGER"); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`DROP TRIGGER IF EXISTS messages_change_insert;
+		DROP TRIGGER IF EXISTS messages_change_update;
+		CREATE TRIGGER messages_change_insert AFTER INSERT ON messages BEGIN
+		 INSERT INTO message_changes(chat_jid,message_id,ingested_at)
+		 VALUES(NEW.chat_jid,NEW.id,CAST(strftime('%s','now') AS INTEGER)*1000+CAST(substr(strftime('%f','now'),4,3) AS INTEGER));
 		 DELETE FROM message_changes WHERE sequence <= (SELECT MAX(sequence)-100000 FROM message_changes);
 		END;
-		CREATE TRIGGER IF NOT EXISTS messages_change_update AFTER UPDATE OF content,media_type,filename,is_from_me ON messages
+		CREATE TRIGGER messages_change_update AFTER UPDATE OF content,media_type,filename,is_from_me ON messages
 		WHEN NEW.content IS NOT OLD.content OR NEW.media_type IS NOT OLD.media_type
 		 OR NEW.filename IS NOT OLD.filename OR NEW.is_from_me IS NOT OLD.is_from_me BEGIN
-		 INSERT INTO message_changes(chat_jid,message_id) VALUES(NEW.chat_jid,NEW.id);
+		 INSERT INTO message_changes(chat_jid,message_id,ingested_at)
+		 VALUES(NEW.chat_jid,NEW.id,CAST(strftime('%s','now') AS INTEGER)*1000+CAST(substr(strftime('%f','now'),4,3) AS INTEGER));
 		 DELETE FROM message_changes WHERE sequence <= (SELECT MAX(sequence)-100000 FROM message_changes);
 		END;`)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type aliasLookup interface {
@@ -66,7 +109,8 @@ func verifiedChatAliases(ctx context.Context, lookup aliasLookup, jid types.JID)
 }
 
 type changedMessage struct {
-	Sequence int64 `json:"sequence"`
+	Sequence   int64  `json:"sequence"`
+	IngestedAt *int64 `json:"ingested_at"`
 	messageListItem
 	ChatName string `json:"chat_name"`
 	Deleted  bool   `json:"deleted"`
@@ -97,7 +141,7 @@ func (store *MessageStore) changesAfter(after int64, limit int) (*messageChanges
 	page.GapDetected = after > page.MaxSequence || (page.OldestSequence > 0 && page.OldestSequence > after+1)
 	rows, err := tx.Query(`SELECT e.sequence,e.message_id,e.chat_jid,COALESCE(m.sender,''),COALESCE(m.content,''),
 		COALESCE(CAST(m.timestamp AS TEXT),''),COALESCE(m.is_from_me,0),COALESCE(m.media_type,''),
-		COALESCE(m.filename,''),COALESCE(m.status,''),COALESCE(c.name,''),m.id IS NULL
+		COALESCE(m.filename,''),COALESCE(m.status,''),COALESCE(c.name,''),m.id IS NULL,e.ingested_at
 		FROM message_changes e LEFT JOIN messages m ON m.chat_jid=e.chat_jid AND m.id=e.message_id
 		LEFT JOIN chats c ON c.jid=e.chat_jid WHERE e.sequence>? ORDER BY e.sequence LIMIT ?`, after, limit+1)
 	if err != nil {
@@ -106,7 +150,7 @@ func (store *MessageStore) changesAfter(after int64, limit int) (*messageChanges
 	defer rows.Close()
 	for rows.Next() {
 		var item changedMessage
-		if err = rows.Scan(&item.Sequence, &item.ID, &item.ChatJID, &item.Sender, &item.Content, &item.Timestamp, &item.IsFromMe, &item.MediaType, &item.Filename, &item.Status, &item.ChatName, &item.Deleted); err != nil {
+		if err = rows.Scan(&item.Sequence, &item.ID, &item.ChatJID, &item.Sender, &item.Content, &item.Timestamp, &item.IsFromMe, &item.MediaType, &item.Filename, &item.Status, &item.ChatName, &item.Deleted, &item.IngestedAt); err != nil {
 			return nil, err
 		}
 		if len(page.Messages) == limit {
@@ -167,6 +211,29 @@ func registerDetectorReadHandlers(mux *http.ServeMux, client *whatsmeow.Client, 
 				phone = strings.TrimSuffix(a, "@s.whatsapp.net")
 			}
 		}
-		writeCapabilityJSON(w, 200, capabilityResponse{Success: true, Data: map[string]any{"jid": jid.String(), "aliases": aliases, "phone_number": phone}})
+		savedName := ""
+		if client != nil && client.Store != nil && client.Store.Contacts != nil {
+			for _, alias := range aliases {
+				contactJID, parseErr := types.ParseJID(alias)
+				if parseErr != nil {
+					continue
+				}
+				contact, contactErr := client.Store.Contacts.GetContact(r.Context(), contactJID)
+				if contactErr != nil {
+					continue
+				}
+				for _, name := range []string{contact.FullName, contact.FirstName} {
+					if strings.ContainsFunc(name, unicode.IsLetter) {
+						savedName = strings.TrimSpace(name)
+						break
+					}
+				}
+				if savedName != "" {
+					break
+				}
+			}
+		}
+		writeCapabilityJSON(w, 200, capabilityResponse{Success: true, Data: map[string]any{"jid": jid.String(), "aliases": aliases, "phone_number": phone,
+			"requester_is_saved_contact": savedName != "", "saved_contact_name": savedName}})
 	})
 }

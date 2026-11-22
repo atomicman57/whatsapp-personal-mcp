@@ -13,7 +13,7 @@ SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test ba
 # Past-tense confirmation that a payment happened; settles a chat's pending split.
 # A pre-payment ask ("please send the receipt after you pay") is not settlement.
 SETTLED = re.compile(r"\b(?:payment (?:successful|received|completed|confirmed)|transfer (?:successful|completed)|transaction successful|"
-                     r"money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
+                     r"(?:i|we) (?:have )?received\s+(?:NGN\s*|₦\s*)?\d[\d,.]*(?:k|m| naira)?|received[,!]?\s+thanks|money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
                      r"(?:here['’]?s|here is|attached is|find attached) (?:the |my |your )?(?:receipt|proof of payment)|(?:receipt|proof of payment) attached)\b",re.I)
 # "if/when/until/once/unless/not/n't" shortly before the phrase, in the same
 # sentence, makes it a condition or denial ("notify me if payment successful").
@@ -31,7 +31,7 @@ TEST_PREFIX = 'TRANSFER_DETECTOR_TEST:'
 PURPOSE = re.compile(r'^(?:for\b|waybill\b|drinks\b|delivery\b|transport\b|gas\b|fuel\b|rent\b|school fees\b|electrician\b|plumbing\b|workmanship\b)',re.I)
 TOTAL = re.compile(r'\b(?:total|balance|amount)\s*[:=\-]*\s*(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
 # A line that starts with TOTAL ("TOTAL==== 63,500", "Total= 51,500") closes an itemized bill.
-STANDALONE_TOTAL = re.compile(r'^[ \t]*(?:grand[ \t]+)?total[ \t]*[:=\-]*[ \t]*(₦|NGN|N(?=[ \t]*\d))?[ \t]*(\d[\d,]*(?:\.\d{1,2})?)[ \t]*(k|m|thousand|million)?(?![\w,])',re.I|re.M)
+STANDALONE_TOTAL = re.compile(r'^[ \t]*(?:grand[ \t]+)?(?:total|totat)[ \t]*[:=\-]*[ \t]*(₦|NGN|N(?=[ \t]*\d))?[ \t]*(\d[\d,]*(?:\.\d{1,2})?)[ \t]*(k|m|thousand|million)?(?![\w,])',re.I|re.M)
 # "U.B.A", "u b a", "G.T.B." -> acronym, only when the letters spell a known bank.
 DOTTED_ACRONYM = re.compile(r'(?<![A-Za-z0-9])[A-Za-z](?:(?:[ \t]*\.[ \t]*|[ \t]+)[A-Za-z]){1,3}\.?(?![A-Za-z0-9])')
 BANK_ACRONYMS = {'UBA','GTB','GTCO','FCMB'}
@@ -127,7 +127,7 @@ def recent_context(source,context,dry_run=False):
         if dry_run:
             if not body.startswith(TEST_PREFIX):continue
             body=body[len(TEST_PREFIX):]
-        if not sensitive(body) and not SYNTHETIC.search(body):result.append({**row,'content':body})
+        if not sensitive(body) and not SYNTHETIC.search(body) and not non_request(body):result.append({**row,'content':body})
     return result
 
 def total_clue(text):
@@ -149,6 +149,7 @@ def amount_clues(text):
     if total:return [total]
     result=[]
     for match in AMOUNT.finditer(text):
+        if re.search(r'\b(?:like|about|around|approximately|roughly)\s*$',text[:match.start()],re.I):continue
         try:
             number=Decimal((match.group(1) or match.group(3)).replace(',',''))
             suffix=(match.group(2) or match.group(4) or '').lower()
@@ -217,11 +218,21 @@ def settled(text):
 def sensitive(text):
     return bool(SECURITY.search(text or ''))
 
-def request_language(text):
-    return bool(ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
+def non_request(text):
+    """Prices, rate quotations and advertised menus cannot complete a request."""
+    payment_action=re.search(r'\b(?:send|transfer|pay|deposit|owe|settle)\b',text,re.I)
+    if not payment_action and re.search(r'\bquotation\b|\b(?:i|we) (?:still )?have your balance\b',text,re.I):return True
+    if re.search(r"\bprice\b|\b(?:at|in|for)\s+(?:the\s+)?market\b",text,re.I) and not re.search(r"\b(?:send|transfer|pay|deposit|owe|settle)\b",text,re.I):return True
+    if re.search(r'\b(?:rate|exchange rate)\s*[:=@-]?\s*\d',text,re.I) and not account_clues(text):return True
+    if re.search(r'\b(?:transfer|buy|sell)\s+\d+(?:\.\d+)?\s*/\s*\d+',text,re.I):return True
+    if re.search(r'\b(?:price list|menu|our prices)\b',text,re.I) and not total_clue(text):return True
+    return False
 
-def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
-    """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded).
+def request_language(text):
+    return bool(not non_request(text) and ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
+
+def linked_amount(source,ordered,accounts,skip_id,window,exclusions,consumed=()):
+    """Earlier unconsumed amount-only evidence: (amounts, from_excluded).
 
     A standalone bare total ("395,000") is preferred over a nearer list of
     several line-item amounts, the vendor quote -> total -> account pattern.
@@ -234,10 +245,11 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
         elapsed=age(source,row)
         if elapsed is None:continue
         if elapsed>window:break
+        if row['id'] in consumed:break
         body=row.get('content') or ''
         row_accounts=account_clues(body)
-        # Stop at another destination; its amount is not ours.
-        if row_accounts and set(row_accounts)!=set(accounts):break
+        # Even a repeated destination begins a separate request.
+        if row_accounts:break
         bare=bare_amount(body)
         found=amount_clues(body) or bare
         if not found:continue
@@ -257,14 +269,18 @@ def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     if nearest_bare:return ([],False) if len(bare_values)>1 else (nearest_bare,False)
     return fallback,False
 
-def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=()):
+def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exclusions=(),consumed=()):
     """Return evidence for a possible request; false positives need bot/owner review."""
     text=source.get('content') or ''
     if sensitive(text) or (SYNTHETIC.search(text) and not dry_run) or RECEIPT.search(text):return None
     if text.startswith(TEST_PREFIX):
         if not dry_run:return None
         text=text[len(TEST_PREFIX):]
-    if excluded(source,text,exclusions):return None
+    if excluded(source,text,exclusions) or non_request(text):return None
+    preceding=[x for x in context if x.get('id')!=source.get('id') and
+               x.get('chat_jid')==source.get('chat_jid') and age(source,x) is not None and
+               timedelta(0)<=age(source,x)<=timedelta(hours=2)]
+    immediate=preceding[-1] if preceding else None
     context=recent_context(source,context,dry_run)
     window=timedelta(seconds=link_window)
     ordered=[]
@@ -295,6 +311,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if accounts and has_bank(text) and not total_clue(text):
         # Account/name/"1900" and itemized "total-48,500" are actual intake formats.
         for match in list(TOTAL.finditer(text))+list(re.finditer(r'(?<![\d,])(\d[\d,]*(?:\.\d{1,2})?)\s*$',text)):
+            if re.search(r'\btest\s*$',text[:match.start(1)],re.I):continue
             value=match.group(1).replace(',','')
             if re.match(r'\s*(?:k|m|thousand|million|naira)\b',text[match.end(1):],re.I):continue
             if len(value.split('.')[0])==10 or any(match.start(1)>=a.start() and match.end(1)<=a.end() for a in ACCOUNT.finditer(text)):continue
@@ -303,14 +320,23 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if accounts and not amounts:
         # Split bill: the amount arrived in an earlier incoming message of the
         # same chat within the link window.
-        found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions)
+        found,from_excluded=linked_amount(source,ordered,accounts,account_source,window,exclusions,consumed)
         if from_excluded:return None
         amounts=found or []
-    if previous and not amounts:amounts=bare_amount(text,strict=False)
+    if not accounts and re.fullmatch(r'[0-9]+',text.strip()):
+        # Digit-only replies require an immediately preceding destination. The
+        # detector also checks that its persisted request still has no amount.
+        elapsed=age(source,previous) if previous else None
+        if not (re.fullmatch(r'[0-9]{3,6}',text.strip()) and int(text.strip())>0 and previous and immediate and
+                previous['id']==immediate['id'] and account_clues(previous.get('content','')) and
+                elapsed is not None and timedelta(0)<=elapsed<=window):return None
+        amounts=[{'text':text.strip(),'amount':str(int(text.strip())),
+                  'currency_hint':None,'currency_explicit':False}]
+    elif previous and not amounts:amounts=bare_amount(text,strict=False)
     direct=request_language(text)
     anchor=source.get('id') if direct or not previous else previous['id']
     previous_accounts=account_clues(previous.get('content','')) if previous else []
-    if previous and previous_accounts and not request_language(previous.get('content','')) and not direct:
+    if previous and previous_accounts and not request_language(previous.get('content','')) and (not direct or (amounts and not accounts)):
         # A split account/bank pair can itself follow the original request.
         # Walk back only until a different destination or the request anchor.
         for older in prior[prior.index(previous)+1:]:
@@ -319,21 +345,27 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             if request_language(older.get('content','')):
                 anchor=older['id'];break
     different_destination=bool(accounts and previous_accounts and set(accounts)!=set(previous_accounts))
-    if different_destination:anchor=account_source
+    if accounts and previous_accounts and account_source==source.get('id'):anchor=account_source
     anchor_row=next((x for x in prior if x['id']==anchor),None)
     # Amount <-> bare destination pairing uses the short link window; an
     # established request keeps the wider conversation window.
-    requested=bool(anchor_row and request_language(anchor_row.get('content','')))
+    requested=bool(anchor_row and request_language(anchor_row.get('content','')) and not account_clues(anchor_row.get('content','')))
     elapsed=age(source,previous) if previous else None
-    follow_up=bool(amounts and previous and (requested or (elapsed is not None and elapsed<=window)))
+    follow_up=bool(amounts and previous and ((requested and not previous_accounts) or (elapsed is not None and elapsed<=window)))
     if follow_up and not accounts and previous_accounts:
         accounts=previous_accounts;account_source=previous['id']
+        if anchor==source.get('id'):anchor=previous['id']
     reasons=[]
     if accounts and (has_bank(text) or previous or any(has_bank(x.get('content','')) for x in prior[:3])):reasons.append('payment_details_with_context')
     if direct:reasons.append('request_language_with_money_or_amount')
     if IMPLICIT.search(text):reasons.append('possible_bill_or_supply_request')
     if follow_up:reasons.append('amount_follow_up')
     purpose_follow_up=bool(previous and PURPOSE.search(text.strip()) and len(text)<400)
+    attachment_follow_up=source.get('media_type') in ('image','document') and previous
+    if (purpose_follow_up or attachment_follow_up) and previous_accounts and not accounts and elapsed is not None and elapsed<=window:
+        # Context-only follow-ups keep the established destination and amount.
+        accounts=previous_accounts;account_source=previous['id']
+        if not amounts:amounts=[{**x,'source_message_id':previous['id']} for x in amount_clues(previous.get('content',''))]
     if purpose_follow_up:reasons.append('purpose_follow_up')
     if source.get('media_type') in ('image','document') and previous:reasons.append('attachment_in_request_context')
     if not reasons:return None
@@ -354,9 +386,9 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
             'bank_name_candidates':bank_name_candidates(*(texts.get(x,'') for x in source_ids)),
             'amount_candidates':amounts,'anchor_message_id':anchor,'source_message_ids':source_ids,
             'beneficiary_verified':False,
-            'amount_ambiguous':len({(x['amount'],x['currency_hint']) for x in amounts})>1,
+            'amount_ambiguous':len(amounts)>1,
             'different_destination_from_previous':different_destination,
-            'amount_missing':not amounts and not any(amount_clues(x.get('content','')) for x in linked_prior),
+            'amount_missing':not amounts,
             'attachment_extraction_needed':source.get('media_type') in ('image','document')}
 
 def digest(*values):

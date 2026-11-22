@@ -35,7 +35,21 @@ Validate ordinary/excluded/outgoing/OTP/receipt/test cases, exact main identity,
 
 The classifier supports compact account/bank/name/amount messages, grouped ten-digit account strings, bank and account details split across nearby messages, bare amounts in an established request, and short purpose follow-ups such as "waybill" or "drinks". Itemized lines such as `Room AC total-105k` retain their amount evidence and ambiguity rather than selecting a payment amount; a line that starts with a total (`TOTAL==== 63,500`, `Total= 51,500`, `Grand total: 35k`) closes the bill, and the last such line is used instead of the line items. Bank acronyms written with dots or spaces (`U.B.A`, `u b a`, `G.T.B`, `F.C.M.B`) match as `UBA`, `GTB`, `FCMB` and `GTCO`, and recognised bank names are reported additively in `bank_name_candidates`.
 
-Split amounts and destinations are paired in either order. When account/bank details arrive without an amount, the nearest earlier incoming same-chat message within the link window that carries an amount supplies it (stopping at a receipt or a different account). When an amount arrives after account/bank details within the link window, it becomes a follow-up of those details and carries their account number. Amount-only messages with no destination in reach create no candidate. Each candidate lists every contributing message in the additive `source_message_ids` field; `anchor_message_id`, and therefore `request_key`, stays on the destination (or original request) message, so the receiver merges the earlier details-only event with the later complete one. Amounts following an explicit request keep the two-hour conversation window. Pairing is re-derived from bridge context on each event, so a restart loses nothing.
+The total marker also accepts the observed typo `totat-6k`. Multiple amount clues without a standalone total leave the card amount null, even if several items have the same price. Approximate amounts such as "like 8k" remain unset. Formal quotations without a payment action do not supply amounts, including quotations with a grand total. Held-balance statements such as "I still have your balance of 5k" are not requests unless they also contain an explicit payment action. Nearby purpose and attachment follow-ups retain the established destination and amount evidence, with the original amount source identified.
+
+`tests/test_transfer_replays.py` runs ten sanitized replay scripts through detector state with a simulated UTC clock. Original multi-hour gaps are preserved; an additional same-chat replay after three days verifies that old amounts do not attach. Media descriptions are fixture metadata only. The detector sees captions, does not OCR images or transcribe audio, and does not extract screenshot product prices.
+
+Replay 3 now passes: bare `2500` updates the coil destination at revision 2 with `changed_fields=["amount"]`, while the older transport destination stays null. Two strict replay expectations remain recorded with `unittest.expectedFailure`. Replay 4 expects a candidate at the image caption, but account digits plus a merchant label without bank or request context do not yet qualify. The bank reply opens one key, and the later amount updates it to revision 2. Replay 7 asks for no candidate before a destination, but explicit destination-less loan requests are supported for review. Its approximate amount stays null, and its next-day account also stays null. Separate passing tests enforce linking and amount isolation for these cases. The default 900-second link window is unchanged.
+
+A bare digit-only reply of 3-6 digits, such as `2500`, supplies an amount only when the immediately preceding same-chat message gave a request-related account, that account's matching active request key has no amount, and the reply is within 900 seconds of the account message. It updates that key with a revision increment and amount-only changed fields. An unrelated intervening message blocks this exception, including messages excluded from request context. No prior account, a completed or inactive key, another chat, or 901 seconds means no amount update. Seven or more bare digits and phone numbers never supply an amount. Grouped amounts and explicit `k`/currency formats retain their existing rules. Bare account digits can still supply destination evidence under the existing account rules.
+
+The latest request snapshot persists accepted amount evidence and its source message ID. Purpose or attachment follow-ups on that same key retain it after outbox cleanup or restart. The empty-amount check for bare replies is repeated inside the outbox/cursor transaction.
+
+Split amounts and destinations are paired in either order. Account/bank details without an amount emit immediately with `card.amount=null`. An earlier amount can attach only from an unconsumed incoming amount-only fragment in the same chat within the link window. A receipt, any intervening destination, or a consumed fragment stops the backward scan. Repeating the same account begins a separate request and never borrows the previous request's amount. Amount-only messages with no destination or request in reach create no candidate.
+
+An amount arriving after account/bank details within the link window updates the same `request_key`, including when the amount reply contains request words such as "please send". The initial event is `transfer_request_candidate` with `revision=1`; the follow-up is `candidate_updated` with `revision=2`, its predecessor's event ID, and `changed_fields=["amount"]` when only the amount changed. Later revisions increment the persisted counter, including name enrichment. Each candidate lists contributing messages in `source_message_ids`; `anchor_message_id` stays on the destination or original request. Explicit requests without destinations retain the existing two-hour conversation window. Unrelated same-chat chatter and bare phone numbers do not reset the destination or the link-window start for explicit or grouped amount replies. The bare digit-only exception requires the immediately preceding account message. At the default setting, replies at 180 and 900 seconds attach; replies at 901 seconds do not. Labels such as "test 8" on destination details are not amounts. Price/market quotes without an explicit transfer action cannot supply split amounts in either order. A reply such as "send 8k for the test 8 account" changes only the amount; the destination reference is not a payment purpose.
+
+The detector records contributing-message ownership atomically with the request, outbox and cursor. Consumed amount fragments cannot supply a different request, even after delivery clears payloads or the detector restarts. A competing worker's stale claim is rejected without advancing the cursor; classification on retry sees the recorded owner. Ownership stores hashed message identifiers and request keys, with no message text or account numbers. Startup backfills retained legacy payloads and also checks emitted-source deduplication records. Legacy requests without a revision counter start at revision 1. No amount is inferred.
 
 Messages matching a spend-report exclusion create no candidate and are never used as context, a request anchor or the amount half of a split. Account details whose nearest amount in the link window is an excluded report are treated as part of that report and also create no candidate. Context linking is limited to preceding messages in the same chat within two hours; the notification's bounded context can still support further bot review. Security/access-code messages are excluded. Regression tests use invented identifiers and names, never private chat records. Historical inspection does not enqueue old requests.
 
@@ -132,12 +146,21 @@ are included.
 `stages(event_id, stage, at)` is append-only with SQLite update/delete guards.
 Owner-authenticated MCP tools are available through existing OAuth transports:
 
-- record_intake_stage(event_id, stage): append intake_received, card_created or
-  owner_alerted only after that action completes. Time comes from the server;
-  no caller timestamp or free text is accepted. Use the revision's own event ID.
+- record_intake_stage(event_id, stage, observed_at=None): append intake_received,
+  card_created or owner_alerted only after that action completes. Existing calls
+  default to server time. A late call can supply UTC ISO-8601 with Z or +00:00, or
+  numeric epoch milliseconds. The time must be at or after the event msg_ts and
+  no more than five seconds ahead of server time. Invalid times append nothing.
+  No free text is accepted. Use the revision's own event ID.
 - get_transfer_latency_report(days=14): per-hop count, median, nearest-rank p90,
   max and event IDs above 5,000 ms, plus overdue events awaiting owner stages.
   days accepts integers 1–90. Earliest duplicate stage timestamps are used.
+  Test/dry-run events leave awaiting_owner_stage only when their message age is
+  greater than ten minutes. Other hop statistics remain unchanged. A content-free
+  test marker survives delivery and restart. Migration backfills retained payloads;
+  previously delivered rows with erased payloads cannot be identified retroactively.
+  Test markers include dry_run, test, is_test or test_flagged boolean flags on the
+  payload/source, and a TRANSFER_DETECTOR_TEST event type or source-content prefix.
 
 Hops cover message-to-ingest, ingest-to-SSE, SSE-to-observe, ingest-to-observe,
 observe-to-POST, classification and HTTP time, POST-to-intake, intake-to-card,
@@ -190,3 +213,101 @@ revision events. Pause intake/delivery during rollback and reconcile queued
 revisions with the owner or retain a compatible receiver before resuming. Restoring
 DB backups requires explicit cursor/outbox dedupe reconciliation because it can
 replay accepted events. No deploy, restart or live send was run for this PR.
+
+## Receiver intake helper
+
+The bot owner can copy `scripts/trb_intake_post.py` to
+`/home/box/transfer-request-bot/intake_post.py`. This PR does not install it.
+Pass one complete webhook payload on stdin in one call:
+
+```sh
+python3 /home/box/transfer-request-bot/intake_post.py --state-dir /home/box/transfer-request-bot < payload.json
+python3 /home/box/transfer-request-bot/intake_post.py --state-dir /home/box/transfer-request-bot --archive --days 14
+```
+
+Use a private state directory. `requests.jsonl` contains private account details;
+keep it out of logs and source control. The helper stores no message text. Its
+stdout is compact JSON with `duplicate`, `applied`, a request summary and
+`related_requests`. Summaries contain request/event IDs, state, amount and account
+last four only. Related means the same source-account/chat requester or exact
+account within the last 14 days, configurable with `--days`. Related requests
+are evidence for review, never payment authority. The helper creates no cards,
+sends no messages and executes no payments. The owner must act only after a
+successful exit and `applied=true`.
+
+A shared file lock serializes callers and archiving. Same-directory atomic
+replacements and a durable redo journal recover an interrupted multi-file write
+on the next locked call. All readers/writers must use this lock; independently
+reading two files during a write does not provide a consistent snapshot. A
+repeated `event_id`, including one in the archive, does not apply twice. Upserts
+use `request_key`; predecessor tracking rejects delayed earlier revisions.
+A conflicting or missing predecessor on an existing request returns
+`review_required=true` and does not overwrite the known revision. Recorded
+conflicts require owner review; repeating the event does not reapply it.
+Unknown non-request events are recorded without creating a request. The compact
+event layout is `event_id,request_key,event_type,previous_event_id,at,applied,changed_fields`.
+
+Archive mode moves terminal requests (`completed`, `paid`, `rejected`, `cancelled`,
+`withdrawn`, `closed`) immediately, and other non-open requests older than the
+cutoff, into `archive/requests-YYYY-MM-DD.jsonl`. Open/pending/review/approved/
+processing requests stay live regardless of age. Events older than the cutoff
+move to `archive/events-YYYY-MM-DD.jsonl`; archived events still participate in
+deduplication and predecessor checks. Archives append safely on repeat runs.
+The helper initializes state as pending and applies detector withdrawals; any
+owner workflow that changes a request state must coordinate through the same
+`.intake.lock` and preserve the existing JSONL fields. This script provides no
+payment or approval state-transition interface.
+
+`candidate_updated.changed_fields` lists changed card field names, sorted for
+ordinary revisions. Account-name enrichment uses `["account_name"]`; the reason
+metadata also clears but is not a separate business change. Receivers can skip
+an account-name-only alert while still upserting the latest revision. The
+snapshot survives delivered-payload cleanup and restarts. On the first update
+of a legacy request without a snapshot, fields are conservatively reported as
+changed. Webhook POSTs reuse one requests Session with HTTPS keep-alive and
+connect/read timeouts of 3/5 seconds. Idempotency keys and backoff are unchanged.
+
+## Attempt-4 deployment procedure for the next authorized release
+
+These are instructions for a separately authorized deployment. Creating this PR
+does not authorize a deploy, service restart or WhatsApp send.
+
+1. Capture both accounts' current image selectors, public route status codes,
+   authenticated MCP tool lists and health/status baselines. Take a **fresh**
+   timestamped `cp -a` backup of configuration, units and complete state/data
+   directories, preserving modes and ownership. Take consistent SQLite online
+   snapshots while running and stopped copies immediately before each cutover.
+   Keep credentials, sessions, tokens, environment and identities unchanged.
+2. Before each cutover, verify the detector cursor is **less than or equal to
+   the bridge durable-feed head**. Compare historical outbox IDs on stable
+   business columns only: `source,payload,attempts,next_attempt,delivered,created`.
+   Refresh that baseline immediately before switching while stopped. Ignore
+   migration defaults/new telemetry columns and assess new rows separately.
+   Stop on a real changed/missing historical row or an incompatible cursor.
+3. Deploy **secondary first** as the canary. Swap its image selector only. Start
+   or restart bridge, then tunnel, then detector. Keep MAIN serving. Observe
+   secondary for **10 minutes** before proceeding to MAIN. Require every gate
+   below throughout the observation. Then repeat the cursor/baseline check,
+   cutover and gates on MAIN, keeping secondary serving.
+4. Require private local `/api/health` on port **8753** to return 200 with the
+   bridge connected/logged in. Require active bridge/tunnel/detector units,
+   detector `stream_connected=true`, no gap, no read/delivery errors, compatible
+   feed head/cursor and no historical replay, resend or mark-read operation.
+   Require public route status-code parity with the captured baseline. A public
+   `/api/health` returning baseline 404 is not the private health gate.
+5. Query the authenticated public MCP endpoint. `tools/list` must include
+   **record_intake_stage** and **get_transfer_latency_report**. Call the latter
+   successfully and verify detector `/status` telemetry. Source code alone
+   does not prove that the deployed endpoint exposes the tools.
+6. Roll back only for real health failures, gaps, broken public routes or real
+   historical row changes. **Swap only the image back**, retaining all live
+   bridge/detector databases, sessions, cursor, dedupe and delivery state.
+   **Never restore an older `messages.db`**, even from the fresh backup. Recheck
+   cursor <= feed head, restart bridge, tunnel, detector in that order, and
+   repeat all health gates. Stop and reconcile an incompatible feed/cursor;
+   never rewind the cursor or replay history to hide a gap.
+
+A missing owner stage is not a rollback trigger. Webhook acceptance alone does
+not establish card creation or owner delivery. Any later live synthetic test
+requires separate WhatsApp-send authorization; do not run `e2e_latency.py --send`
+as part of preparing or reviewing this PR.

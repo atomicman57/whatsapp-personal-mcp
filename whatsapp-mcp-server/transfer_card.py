@@ -24,6 +24,9 @@ def card_for(row, clues, aliases, rows):
         text = item.get('content') or ''
         match = re.search(r'\bfor\s+(.{1,240})', text, re.I)
         if match:
+            # A destination reference identifies the request, not its purpose.
+            if re.fullmatch(r'(?:(?:the|this|that)\s+)?(?:test\s+\d+\s+)?(?:acct|account)[.!?\s]*', match[1], re.I):
+                continue
             purpose = re.split(r'[.;\n]|\b(?:bank|acct|account)\b|\d{10,}', match[1], maxsplit=1, flags=re.I)[0].strip()[:240] or None
         elif re.match(r'^(?:waybill|drinks|delivery|transport|gas|fuel|rent|school fees|plumbing)\b', text, re.I):
             purpose = text[:240]
@@ -63,7 +66,8 @@ class NameEnquiry:
         if name:
             card.update(account_name=name, account_name_reason=None)
             payload.update(event_id=digest(row[0], 'name-enquiry', name), event_type='candidate_updated',
-                           previous_event_id=row[0], revision_hint='replace_card_for_request_key')
+                           previous_event_id=row[0], revision_hint='replace_card_for_request_key',
+                           changed_fields=['account_name'])
             self.state.enriched(payload, row[0])
         with self.state.lock, self.state.db() as db:
             db.execute("UPDATE name_enquiries SET status=?,payload=NULL WHERE event_id=?",

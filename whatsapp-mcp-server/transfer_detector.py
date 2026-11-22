@@ -14,14 +14,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from transfer_telemetry import migrate, milliseconds, record, report
+from transfer_telemetry import migrate, milliseconds, record, report, is_test_event
 from transfer_card import card_for, NameEnquiry
 from transfer_detection import (DEFAULT_EXCLUDED_CHAT_PHRASES,LINK_WINDOW_SECONDS,TEST_PREFIX,classify,digest,
     parse_excluded_chat_phrases,parse_link_window,safe_context,sensitive,settled,source_digest)
 
 DEFAULT_SOURCE_ACCOUNT='whatsapp-main'
 
-WEBHOOK_TIMEOUT=(5,20)  # connect, read seconds; used by Webhook.send
+WEBHOOK_TIMEOUT=(3,5)  # connect, read seconds; used by Webhook.send
 # An outbox claim older than this is treated as abandoned (crash mid-send) and may be reclaimed.
 # It must exceed the longest send (WEBHOOK_TIMEOUT) with margin so a live send is never reclaimed.
 CLAIM_LEASE_SECONDS=120
@@ -98,11 +98,22 @@ class State:
             migrate(db)
             db.executescript('''CREATE TABLE IF NOT EXISTS requests_latest(request_key TEXT PRIMARY KEY,event_id TEXT NOT NULL,chat_jid TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS name_enquiries(event_id TEXT PRIMARY KEY,payload TEXT,status TEXT NOT NULL DEFAULT 'pending');''')
+            if 'card' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
+                db.execute('ALTER TABLE requests_latest ADD COLUMN card TEXT')
+            if 'amounts' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
+                db.execute('ALTER TABLE requests_latest ADD COLUMN amounts TEXT')
+            if 'revision' not in {x[1] for x in db.execute('PRAGMA table_info(requests_latest)')}:
+                db.execute('ALTER TABLE requests_latest ADD COLUMN revision INTEGER NOT NULL DEFAULT 1')
+            db.execute('CREATE TABLE IF NOT EXISTS message_requests(source TEXT PRIMARY KEY,request_key TEXT NOT NULL)')
+            # Retained legacy payloads can establish ownership without storing text or accounts.
+            for body, in db.execute('SELECT payload FROM outbox WHERE payload IS NOT NULL AND request_key IS NOT NULL ORDER BY rowid'):
+                value=json.loads(body)
+                self._own_messages(db,value)
             for key,event_id,body in db.execute('SELECT request_key,id,payload FROM outbox WHERE request_key IS NOT NULL AND payload IS NOT NULL ORDER BY rowid'):
                 value=json.loads(body)
                 chat=(value.get('source') or {}).get('chat_jid')
                 if chat:
-                    db.execute('INSERT OR IGNORE INTO requests_latest VALUES(?,?,?,1)',(key,event_id,chat))
+                    db.execute('INSERT OR IGNORE INTO requests_latest(request_key,event_id,chat_jid,active) VALUES(?,?,?,1)',(key,event_id,chat))
             # Claims are not cleared here: another worker may be mid-send. A claim stranded by a crash
             # becomes due again once older than CLAIM_LEASE_SECONDS (see due/attempt_started).
     @contextmanager
@@ -127,14 +138,26 @@ class State:
     def seen(self,source):
         with self.lock,self.db() as db:
             return db.execute('SELECT digest,event FROM seen WHERE source=?',(source,)).fetchone()
+    @staticmethod
+    def _own_messages(db,payload):
+        source=payload.get('source',{})
+        for message_id in payload.get('candidate',{}).get('source_message_ids',[]):
+            key=digest(payload.get('source_instance'),source.get('chat_jid'),message_id)
+            db.execute('INSERT OR IGNORE INTO message_requests VALUES(?,?)',(key,payload['request_key']))
+    def consumed_messages(self,account,chat,rows):
+        with self.lock,self.db() as db:
+            return {row['id'] for row in rows if
+                    db.execute('SELECT 1 FROM message_requests WHERE source=?',(digest(account,chat,row['id']),)).fetchone() or
+                    db.execute('SELECT 1 FROM seen WHERE source=?',(digest(account,chat,row['id']),)).fetchone()}
     def _queue(self,db,source,payload):
+        test_event=int(is_test_event(payload))
         payload=bounded_notification(payload)
         if db.execute('SELECT count(*) FROM outbox WHERE delivered IS NULL').fetchone()[0]>=10000:
             raise RuntimeError('outbox_capacity')
-        db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms,request_key,held,next_attempt,msg_ts,ingested_at,sse_wake_at,observed_at,classify_ms) VALUES(?,?,?,?,?,?,?,0,0,?,?,?,?,?)',
+        db.execute('INSERT OR IGNORE INTO outbox(id,source,payload,created,observed,processing_ms,request_key,held,next_attempt,msg_ts,ingested_at,sse_wake_at,observed_at,classify_ms,test_event) VALUES(?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)',
             (payload['event_id'],source,json.dumps(payload),utcnow(),payload.get('detector_observed_at'),payload.get('detector_processing_ms'),payload.get('request_key'),
              milliseconds(payload.get('source',{}).get('timestamp')) if payload.get('source',{}).get('timestamp') else None,
-             payload.get('ingested_at'),payload.get('sse_wake_at'),milliseconds(payload.get('detector_observed_at')) if payload.get('detector_observed_at') else None,payload.get('detector_processing_ms')))
+             payload.get('ingested_at'),payload.get('sse_wake_at'),milliseconds(payload.get('detector_observed_at')) if payload.get('detector_observed_at') else None,payload.get('detector_processing_ms'),test_event))
         if self.events is not None:self.events.publish(db,payload,0)
         return payload
     def consume(self,sequence,source,body_digest,payload,hold_until=0):
@@ -156,10 +179,26 @@ class State:
                         db.execute('DELETE FROM outbox WHERE id=? AND delivered IS NULL AND first_attempt IS NULL',(previous,))
                         if self.events is not None:self.events.cancel_pending(db,[previous])
                 if request_key and not payload.get('candidate_withdrawn'):
-                    previous=db.execute('SELECT event_id FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
+                    # Recheck ownership in the write transaction: another worker may
+                    # have attached a fragment after this payload was built.
+                    for amount in payload.get('candidate',{}).get('amount_candidates',[]):
+                        message_source=digest(payload.get('source_instance'),payload['source']['chat_jid'],amount['source_message_id'])
+                        owner=db.execute('SELECT request_key FROM message_requests WHERE source=?',(message_source,)).fetchone()
+                        if owner and owner[0]!=request_key:raise RuntimeError('amount_fragment_already_consumed')
+                    previous=db.execute('SELECT event_id,card,revision FROM requests_latest WHERE request_key=? AND active=1',(request_key,)).fetchone()
+                    if re.fullmatch(r'[0-9]{3,6}',(payload.get('source',{}).get('content') or '').strip()):
+                        old_card=json.loads(previous[1]) if previous and previous[1] else {}
+                        if (not old_card or old_card.get('amount') is not None or
+                                old_card.get('account_number')!=payload.get('card',{}).get('account_number')):
+                            raise RuntimeError('bare_amount_request_no_longer_empty')
+                    payload['revision']=previous[2]+int(previous[0]!=payload['event_id']) if previous else 1
                     if previous and previous[0]!=payload['event_id']:
-                        payload.update(event_type='candidate_updated',previous_event_id=previous[0],revision_hint='replace_card_for_request_key')
-                    db.execute('INSERT OR REPLACE INTO requests_latest VALUES(?,?,?,1)',(request_key,payload['event_id'],payload['source']['chat_jid']))
+                        old_card=json.loads(previous[1]) if previous[1] else {}
+                        new_card=payload.get('card',{})
+                        payload.update(event_type='candidate_updated',previous_event_id=previous[0],revision_hint='replace_card_for_request_key',
+                            changed_fields=sorted(k for k in old_card.keys()|new_card.keys() if old_card.get(k)!=new_card.get(k)))
+                    db.execute('INSERT OR REPLACE INTO requests_latest(request_key,event_id,chat_jid,active,card,revision,amounts) VALUES(?,?,?,1,?,?,?)',(request_key,payload['event_id'],payload['source']['chat_jid'],json.dumps(payload.get('card',{})),payload['revision'],json.dumps(payload.get('candidate',{}).get('amount_candidates',[]))))
+                    self._own_messages(db,payload)
                 payload=self._queue(db,source,payload)
                 if payload.get('card',{}).get('account_name_reason')=='pending_nonblocking':
                     db.execute('INSERT OR IGNORE INTO name_enquiries(event_id,payload) VALUES(?,?)',(payload['event_id'],json.dumps(payload)))
@@ -169,11 +208,12 @@ class State:
     def enriched(self,payload,original):
         with self.lock,self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            latest=db.execute('SELECT event_id FROM requests_latest WHERE request_key=? AND active=1',(payload['request_key'],)).fetchone()
+            latest=db.execute('SELECT event_id,revision FROM requests_latest WHERE request_key=? AND active=1',(payload['request_key'],)).fetchone()
             # Do not resurrect withdrawn requests or replace a newer amount/destination revision.
             if not latest or latest[0]!=original:return
+            payload['revision']=latest[1]+1
             self._queue(db,'name_enquiry',payload)
-            db.execute('UPDATE requests_latest SET event_id=? WHERE request_key=?',(payload['event_id'],payload['request_key']))
+            db.execute('UPDATE requests_latest SET event_id=?,card=?,revision=? WHERE request_key=?',(payload['event_id'],json.dumps(payload.get('card',{})),payload['revision'],payload['request_key']))
     def cancel_held(self,chat_jid):
         """Cancel unsent candidates and emit one withdrawal per active request, atomically."""
         with self.lock,self.db() as db:
@@ -278,12 +318,15 @@ class Webhook:
             raise ValueError('invalid webhook authorization header')
         if not value or '\n' in value or '\r' in value:raise ValueError('webhook authorization required')
         self.url=url;self.headers={header:value}
+        self.session=requests.Session()
+        self.session.trust_env=False
     def send(self,event_id,payload):
         try:
             body=json.dumps(payload,ensure_ascii=False,separators=(',',':')).encode()
-            response=requests.post(self.url,data=body,headers={**self.headers,'Content-Type':'application/json','Idempotency-Key':event_id},
+            response=self.session.post(self.url,data=body,headers={**self.headers,'Content-Type':'application/json','Idempotency-Key':event_id},
                                    timeout=WEBHOOK_TIMEOUT,allow_redirects=False)
             self.last_status=response.status_code
+            response.close()
             # Acceptance is not evidence that the receiving bot has processed it.
             if 200<=response.status_code<300:return True,None
             return False,'webhook_http_'+str(response.status_code)
@@ -357,8 +400,25 @@ class Detector:
             except (ValueError,TypeError,KeyError):continue
         rows.sort(key=lambda x:(parsed_time(x['timestamp']),x['id']))
         rows=rows[-20:]
-        clues=classify(row,rows,dry_run,self.link_window,self.exclusions)
+        consumed=self.state.consumed_messages(self.account,row['chat_jid'],rows)
+        clues=classify(row,rows,dry_run,self.link_window,self.exclusions,consumed)
         if not clues:return skip()
+        request_key=digest(self.account,row['chat_jid'],clues['anchor_message_id'])
+        with self.state.lock,self.state.db() as db:
+            latest=db.execute('SELECT card,amounts FROM requests_latest WHERE request_key=? AND active=1',
+                              (request_key,)).fetchone()
+        old_card=json.loads(latest[0]) if latest and latest[0] else {}
+        if re.fullmatch(r'[0-9]{3,6}',(row.get('content') or '').strip()):
+            if (not old_card or old_card.get('amount') is not None or
+                    clues['account_number_candidates']!=[old_card.get('account_number')]):return skip()
+        if (not clues['amount_candidates'] and old_card.get('amount') is not None and
+                clues['account_number_candidates']==[old_card.get('account_number')] and
+                {'purpose_follow_up','attachment_in_request_context'} & set(clues['reasons'])):
+            clues['amount_candidates']=json.loads(latest[1]) if latest[1] else []
+            for amount in clues['amount_candidates']:
+                if amount['source_message_id'] not in clues['source_message_ids']:
+                    clues['source_message_ids'].append(amount['source_message_id'])
+            clues['amount_missing']=not clues['amount_candidates']
         cleaned,truncated=safe_context(rows)
         base['source']['content']=(row.get('content') or '')[:2000]
         base['source']['phone_number']=phone
@@ -367,7 +427,7 @@ class Detector:
             card['account_name_reason']='pending_nonblocking' if card['account_number'] and card['bank'] else 'destination_missing_or_ambiguous'
         return source_key,body_hash,timed({**base,'event_type':'transfer_request_candidate','candidate':clues,
             'card':card,'requester_is_saved_contact':card['requester_is_saved_contact'],
-            'request_key':digest(self.account,row['chat_jid'],clues['anchor_message_id']),
+            'request_key':request_key,
             'context':cleaned,'context_truncated':truncated or len(row.get('content',''))>2000,
             'context_may_be_incomplete':len(context)>=50 or not any(x['id']==row['id'] for x in rows),
             'dry_run':dry_run,'previous_event_id':prior[1] if prior else None})
@@ -459,8 +519,9 @@ def status_server(state,token,port=8755):
                 length=int(self.headers.get('Content-Length','0'))
                 if not 0<length<=1024:raise ValueError()
                 value=json.loads(self.rfile.read(length))
-                if not isinstance(value,dict) or set(value)!={'event_id','stage'}:raise ValueError()
-                self.answer(record(state,value['event_id'],value['stage']))
+                if (not isinstance(value,dict) or not {'event_id','stage'} <= set(value)
+                        or set(value) - {'event_id','stage','observed_at'}):raise ValueError()
+                self.answer(record(state,value['event_id'],value['stage'],value.get('observed_at')))
             except (ValueError,TypeError):self.send_error(400)
     server=ThreadingHTTPServer(('127.0.0.1',port),Handler)
     threading.Thread(target=server.serve_forever,daemon=True).start()

@@ -113,12 +113,15 @@ class LatencyTests(unittest.TestCase):
 
     def test_webhook_idempotency_header_and_real_http_status(self):
         webhook = Webhook('https://example.invalid/wake', 'X-Owner-Key', 'synthetic-key')
-        with patch('transfer_detector.requests.post', return_value=Mock(status_code=202)) as post:
+        with patch.object(webhook.session, 'post', return_value=Mock(status_code=202)) as post:
             for _ in range(2):
                 self.assertEqual(webhook.send('synthetic-event', {'payment_authorized': False}), (True, None))
             self.assertEqual(post.call_args.kwargs['headers']['Idempotency-Key'], 'synthetic-event')
             self.assertFalse(post.call_args.kwargs['allow_redirects'])
             self.assertEqual(webhook.last_status, 202)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(post.call_args.kwargs['timeout'], (3, 5))
+            self.assertFalse(webhook.session.trust_env)
 
     def test_telemetry_attempts_persist_and_end_to_end_requires_owner_stage(self):
         stamp = milliseconds()
@@ -170,7 +173,89 @@ class LatencyTests(unittest.TestCase):
         response = requests.get(base+'/latency?days=14',headers=auth)
         self.assertEqual(response.status_code,200)
         self.assertNotIn('content',response.text)
-        self.assertNotIn('0123456789',response.text)
+        self.assertNotIn('0000012345',response.text)
+
+    def test_late_stage_time_formats_and_default(self):
+        key = self.add(message())[0]
+        now = milliseconds()
+        with self.state.db() as db:
+            db.execute('UPDATE outbox SET msg_ts=? WHERE id=?', (now-60000, key))
+        with patch('transfer_telemetry.time.time', return_value=now/1000):
+            for stage, offset in [('intake_received', 50000), ('card_created', 40000), ('owner_alerted', 30000)]:
+                stamp = now-offset
+                for value in (stamp, datetime.fromtimestamp(stamp/1000, timezone.utc).isoformat().replace('+00:00', 'Z')):
+                    self.assertEqual(record(self.state, key, stage, value)['at'], stamp)
+            self.assertEqual(record(self.state, key, 'owner_alerted')['at'], now)
+            self.assertEqual(record(self.state, key, 'card_created', now+5000)['at'], now+5000)
+            self.assertEqual(record(self.state, key, 'intake_received', float(now-60000))['at'], now-60000)
+        result = report(self.state)
+        self.assertEqual(result['hops']['message_to_owner']['max_ms'], 30000)
+        self.assertEqual(result['hops']['intake_to_card']['max_ms'], 20000)
+
+    def test_invalid_stage_times_append_nothing(self):
+        key = self.add(message())[0]
+        now = milliseconds()
+        with self.state.db() as db:
+            db.execute('UPDATE outbox SET msg_ts=? WHERE id=?', (now-60000, key))
+        invalid = [now-60001, now+5001, True, False, float('nan'), float('inf'),
+                   -1, {}, [], 'yesterday', str(now), '2026-01-01',
+                   '2026-01-01T00:00:00', '2026-01-01T00:00:00+01:00']
+        with patch('transfer_telemetry.time.time', return_value=now/1000):
+            for value in invalid:
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'invalid_observed_at'):
+                    record(self.state, key, 'card_created', value)
+        with self.state.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM stages').fetchone()[0], 0)
+        self.assertEqual(record_intake_stage(key, 'card_created', True)['code'], 'invalid_observed_at')
+
+    def test_stage_http_accepts_observed_at_and_rejects_invalid_times(self):
+        key = self.add(message())[0]
+        now = milliseconds()
+        with self.state.db() as db:
+            db.execute('UPDATE outbox SET msg_ts=? WHERE id=?', (now-60000, key))
+        server = status_server(self.state, 'synthetic-key', port=0)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = 'http://127.0.0.1:' + str(server.server_address[1]) + '/stages'
+        payload = {'event_id': key, 'stage': 'intake_received', 'observed_at': now-30000}
+        auth = {'Authorization': 'Bearer synthetic-key'}
+        self.assertEqual(requests.post(url, json=payload).status_code, 401)
+        response = requests.post(url, json=payload, headers=auth)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['at'], now-30000)
+        payload['observed_at'] = now-60001
+        self.assertEqual(requests.post(url, json=payload, headers=auth).status_code, 400)
+
+    def test_test_events_age_out_only_from_awaiting_after_ten_minutes(self):
+        now = milliseconds()
+        markers = [{'dry_run': True}, {'test': True}, {'is_test': True},
+                   {'test_flagged': True}, {'event_type': 'TRANSFER_DETECTOR_TEST'},
+                   {'source': {'content': 'TRANSFER_DETECTOR_TEST: synthetic'}}]
+        for index, marker in enumerate(markers + [{}]):
+            body = {'event_id': 'synthetic-' + str(index), **marker}
+            body.setdefault('source', {})['timestamp'] = now-600001
+            with self.state.db() as db:
+                self.state._queue(db, body['event_id'], body)
+            self.state.delivered(body['event_id'])
+        restarted = State(self.root)
+        with patch('transfer_telemetry.time.time', return_value=now/1000):
+            self.assertEqual([x['event_id'] for x in report(restarted)['awaiting_owner_stage']], ['synthetic-6'])
+            with restarted.db() as db:
+                db.execute('UPDATE outbox SET msg_ts=?', (now-600000,))
+            self.assertEqual(len(report(restarted)['awaiting_owner_stage']), 7)
+            with restarted.db() as db:
+                db.execute('UPDATE outbox SET msg_ts=?', (now-600001,))
+            record(restarted, 'synthetic-0', 'card_created', now-1)
+            self.assertEqual(report(restarted)['hops']['message_to_owner']['count'], 1)
+
+    def test_test_marker_migration_backfills_retained_payload(self):
+        with self.state.db() as db:
+            self.state._queue(db, 'synthetic', {'event_id': 'synthetic', 'dry_run': True,
+                             'source': {'timestamp': milliseconds()-700000}})
+            db.execute('ALTER TABLE outbox DROP COLUMN test_event')
+        restarted = State(self.root)
+        restarted.delivered('synthetic')
+        self.assertEqual(report(restarted)['awaiting_owner_stage'], [])
 
     def configured_enquiry(self):
         env = patch.dict(os.environ, {'WHATSAPP_TRANSFER_NAME_ENQUIRY_URL':'https://example.invalid/enquiry'})
@@ -206,9 +291,20 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual(updated['request_key'],first['request_key'])
         self.assertEqual(updated['previous_event_id'],first['event_id'])
         self.assertEqual(updated['card']['account_name'],'Verified Demo')
+        self.assertEqual(updated['changed_fields'], ['account_name'])
         self.state.cancel_held(first['source']['chat_jid'])
         self.state.enriched(updated, updated['event_id'])
         self.assertEqual([p['event_type'] for p in self.pending()],['candidate_withdrawn'])
+
+    def test_changed_fields_survive_delivered_payload_cleanup_and_restart(self):
+        first = self.add(message())[1]
+        self.detector.deliver_one()
+        self.state = State(self.root)
+        self.detector.state = self.state
+        self.add(message(2, 'Please send NGN 15,000 for plumbing. Bank: Demo Bank. Account 0000012345.', id='message-1'))
+        updated = self.state.due()[1]
+        self.assertEqual(updated['previous_event_id'], first['event_id'])
+        self.assertEqual(updated['changed_fields'], ['amount'])
 
     def test_migration_releases_legacy_hold_without_changing_claim(self):
         key = self.add(message())[0]
@@ -337,6 +433,9 @@ class OwnerTransportTests(unittest.IsolatedAsyncioTestCase):
                 request.return_value.json.return_value={'event_id':'synthetic','stage':'card_created','at':1}
                 self.assertEqual(record_intake_stage('synthetic','card_created')['at'],1)
                 self.assertEqual(request.call_args.kwargs['json'],{'event_id':'synthetic','stage':'card_created'})
+                stamp = milliseconds()-10000
+                record_intake_stage('synthetic','intake_received',stamp)
+                self.assertEqual(request.call_args.kwargs['json'],{'event_id':'synthetic','stage':'intake_received','observed_at':stamp})
         finally:auth_context_var.reset(context)
 
 class NameEnquiryDeadlineTests(unittest.TestCase):

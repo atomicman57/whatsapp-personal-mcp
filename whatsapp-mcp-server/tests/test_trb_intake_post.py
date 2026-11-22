@@ -54,6 +54,23 @@ class IntakeTests(unittest.TestCase):
                          ['event_id', 'request_key', 'event_type', 'previous_event_id', 'at', 'applied', 'changed_fields'])
         self.assertEqual((self.root / 'requests.jsonl').stat().st_mode & 0o777, 0o600)
 
+    def test_resend_after_handled_or_completed_is_new_request_with_context(self):
+        for status in ('handled', 'completed'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                intake.intake(root, payload())
+                rows = intake.read_lines(root / 'requests.jsonl')
+                rows[0]['state'] = status
+                intake.commit(root, {'requests.jsonl': rows})
+                resent = payload('new-message-event', 'new-message-request')
+                result = intake.intake(root, resent)
+                self.assertTrue(result['applied'])
+                self.assertFalse(result['duplicate'])
+                self.assertEqual(result['related_requests'][0]['request_key'], 'request-1')
+                self.assertEqual(result['related_requests'][0]['state'], status)
+                self.assertEqual(len(intake.read_lines(root / 'requests.jsonl')), 2)
+                self.assertTrue(intake.intake(root, resent)['duplicate'])
+
     def test_related_matches_requester_or_account_but_only_recent(self):
         intake.intake(self.root, payload())
         second = payload('event-2', 'request-2')

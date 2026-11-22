@@ -153,7 +153,7 @@ class ClassifierTests(unittest.TestCase):
         for text in ['OTP 123456: do not share','Your verification code is 0000012345',
                      'Please send the receipt for NGN 5000','Payment successful NGN 5000',
                      'Price is NGN 5000, available in stock','Call +2348000000002',
-                     'Synthetic test only, please send NGN 5000','0000012345']:
+                     'Synthetic test only, please send NGN 5000']:
             self.assertIsNone(classify(message(text=text)),text)
         result=classify(message(text='Please send NGN 5000; my phone is 08000000003'))
         self.assertEqual(result['account_number_candidates'],[])
@@ -209,7 +209,7 @@ class SplitBillTests(unittest.TestCase):
         self.assertEqual(normalise_banks('I a m here'),'I a m here')
         self.assertFalse(has_bank('a b c'))
         result=classify(message(text='0000012345 G.T.B Demo Beneficiary'))
-        self.assertEqual(result['bank_name_candidates'],['GTB'])
+        self.assertEqual(result['bank_name_candidates'],['GTBank'])
         result=classify(message(text='0000012345\nF.C.M.B'))
         self.assertEqual(result['bank_name_candidates'],['FCMB'])
     def test_standalone_total_preferred_over_line_items(self):
@@ -250,7 +250,10 @@ class SplitBillTests(unittest.TestCase):
     def test_bill_then_account_then_dotted_bank_in_three_messages(self):
         rows=[chef(1,KITCHEN,minutes_ago=4),chef(2,'0000012345',minutes_ago=2),chef(3,'u b a')]
         bill,account,bank=self.run_chat(rows)
-        self.assertIsNone(bill);self.assertIsNone(account)
+        self.assertIsNone(bill)
+        self.assertEqual(account['account_number_candidates'], ['0000012345'])
+        self.assertEqual(account['amount_candidates'][0]['amount'], '51500')
+        self.assertEqual(account['bank_name_candidates'], [])
         self.assertEqual(bank['source_message_ids'],['synthetic-chef-1','synthetic-chef-2','synthetic-chef-3'])
         self.assertEqual(bank['amount_candidates'][0]['amount'],'51500')
         self.assertEqual(bank['account_number_candidates'],['0000012345'])
@@ -477,6 +480,92 @@ class RuntimeTests(unittest.TestCase):
     def queued_payloads(self):
         with self.state.db() as db:
             return [json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox WHERE payload IS NOT NULL ORDER BY rowid')]
+
+    def test_gt_aliases_emit_missing_amount_immediately(self):
+        for bank in ('Gt', 'GT', 'GTB', 'gtbank', 'GTCO', 'Guaranty Trust', 'G.T.B.'):
+            with self.subTest(bank=bank):
+                self.setUp()
+                row = message(1, '0000012345\n' + bank)
+                self.add(row)
+                self.detector.drain()
+                payload, = self.queued_payloads()
+                self.assertEqual(payload['card']['bank'], 'GTBank')
+                self.assertEqual(payload['card']['account_number'], '0000012345')
+                self.assertIsNone(payload['card']['amount'])
+                self.assertTrue(payload['candidate']['amount_missing'])
+                self.assertEqual(self.detector.hold_until(row, payload), 0)
+                self.assertTrue(self.detector.deliver_one())
+                self.assertEqual(len(self.hook.calls), 1)
+
+    def test_new_account_only_message_always_emits_even_after_settlement(self):
+        for settled_request in (False, True):
+            with self.subTest(settled=settled_request):
+                self.setUp()
+                self.add(message(1, 'Please send NGN 5,000 to 0000012345 Wema'))
+                self.detector.drain()
+                first, = self.queued_payloads()
+                self.detector.deliver_one()
+                if settled_request:
+                    self.add(message(2, 'Payment completed', timestamp=(NOW+timedelta(seconds=5)).isoformat()))
+                    self.detector.drain()
+                    while self.detector.deliver_one():
+                        pass
+                self.add(message(3, '0000012345', timestamp=(NOW+timedelta(days=3)).isoformat()))
+                self.detector.drain()
+                payload, = self.queued_payloads()
+                self.assertNotEqual(payload['request_key'], first['request_key'])
+                self.assertIsNone(payload['card']['amount'])
+                self.assertEqual(payload['candidate']['source_message_ids'], ['message-3'])
+                self.assertEqual(payload['prior_requests'][0]['request_key'], first['request_key'])
+                self.assertEqual(payload['prior_requests'][0]['status'], 'inactive' if settled_request else 'open')
+                self.assertTrue(payload['prior_requests'][0]['at'])
+                self.assertTrue(self.detector.deliver_one())
+
+    def test_same_chat_same_amount_new_request_never_suppressed(self):
+        for text in ('Please send NGN 5,000', 'Please send NGN 5,000 to 0000012345 Wema'):
+            with self.subTest(with_account='Wema' in text):
+                self.setUp()
+                self.add(message(1, '0000012345 Wema NGN 5,000'))
+                self.detector.drain()
+                first, = self.queued_payloads()
+                self.detector.deliver_one()
+                self.add(message(2, text, timestamp=(NOW+timedelta(seconds=10)).isoformat()))
+                self.detector.drain()
+                second, = self.queued_payloads()
+                self.assertNotEqual(first['request_key'], second['request_key'])
+                self.assertEqual(second['card']['amount']['value'], '5000')
+                self.assertEqual(second['candidate']['source_message_ids'], ['message-2'])
+                self.assertEqual(second['prior_requests'][0]['request_key'], first['request_key'])
+                self.assertTrue(self.detector.deliver_one())
+                self.assertEqual(len(self.hook.calls), 2)
+
+    def test_prior_request_context_is_bounded_metadata_and_never_a_filter(self):
+        for sequence in range(1, 6):
+            self.add(message(sequence, '0000012345 Wema NGN 5,000',
+                             timestamp=(NOW+timedelta(seconds=sequence)).isoformat()))
+            self.detector.drain()
+            self.assertTrue(self.detector.deliver_one())
+        self.assertEqual(len(self.hook.calls), 5)
+        latest = self.hook.calls[-1][1]
+        self.assertEqual(len(latest['prior_requests']), 3)
+        self.assertTrue(latest['prior_requests_truncated'])
+        self.assertEqual(latest['prior_requests_status_source'], 'local_detector')
+        for previous in latest['prior_requests']:
+            self.assertEqual(set(previous), {'request_key', 'status', 'at'})
+        self.assertLessEqual(len(json.dumps(latest, ensure_ascii=False, separators=(',', ':')).encode()), 3500)
+
+    def test_identical_content_new_message_emits_exact_id_duplicate_does_not(self):
+        self.add(message(1, '0000012345 Wema NGN 5,000'))
+        self.detector.drain()
+        self.detector.deliver_one()
+        self.add(message(2, '0000012345 Wema NGN 5,000', timestamp=(NOW+timedelta(seconds=5)).isoformat()))
+        self.detector.drain()
+        self.detector.deliver_one()
+        self.add(message(3, '0000012345 Wema NGN 5,000', id='message-2', timestamp=(NOW+timedelta(seconds=5)).isoformat()))
+        self.detector.drain()
+        self.assertFalse(self.detector.deliver_one())
+        self.assertEqual(len(self.hook.calls), 2)
+        self.assertNotEqual(self.hook.calls[0][1]['request_key'], self.hook.calls[1][1]['request_key'])
 
     def test_completed_request_amount_is_not_borrowed_by_repeated_account(self):
         for later in ('Please send to 0000012345 Wema Demo', 'Account: 0000012345 Wema bank'):

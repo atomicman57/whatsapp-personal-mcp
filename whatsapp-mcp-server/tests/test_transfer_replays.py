@@ -83,8 +83,13 @@ class ReplayTests(unittest.TestCase):
         old, new = self.destinations()[GTBANK], self.destinations()[WEMA]
         self.assertEqual(self.amount(old), '8000')
         self.assertIsNone(self.amount(new))
-        self.assertEqual(new['revision'], 1)
+        self.assertEqual(new['revision'], 2)
         self.assertEqual(new['card']['bank'], 'Wema')
+        account = self.steps[5][-1]
+        self.assertEqual(account['revision'], 1)
+        self.assertIsNone(account['card']['bank'])
+        self.assertIsNone(self.amount(account))
+        self.assertEqual(new['previous_event_id'], account['event_id'])
 
     def test_replay_03_new_destination_then_bare_amount(self):
         self.replay(3)

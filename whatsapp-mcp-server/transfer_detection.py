@@ -24,6 +24,8 @@ ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
 BANK = re.compile(r'\b(?:bank|acct|account(?: number)?|uba|gtbank|gtb|gtco|gt|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
 AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million|naira)\b',re.I)
+SENTENCE_AMOUNT = re.compile(r'(?<![\w.,+\-])(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?)(?![\w,.])')
+AMOUNT_REQUEST = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|deposit|lend|borrow|owe)\s+(?:me\s+)?$',re.I)
 FX_AMOUNT = re.compile(r'(USD|EUR|GBP|\$|€|£)\s*(\d[\d,]*(?:\.\d{1,2})?)',re.I)
 IMPLICIT = re.compile(r'\b(?:gas|fuel|rent|school fees|electricity bill)\b.{0,50}\b(?:finish(?:ed)?|due|expired|renew)\b',re.I)
 TEST_PREFIX = 'TRANSFER_DETECTOR_TEST:'
@@ -148,8 +150,14 @@ def amount_clues(text):
     total=total_clue(text)
     if total:return [total]
     result=[]
+    destinations=[m.span() for pattern in (ACCOUNT,PHONE) for m in pattern.finditer(text)]
+    def destination_number(match,raw):
+        digits=raw.split('.')[0].replace(',','')
+        return (len(digits)==10 or PHONE.fullmatch(digits) or
+                any(start<match.end() and match.start()<end for start,end in destinations))
     for match in AMOUNT.finditer(text):
         if re.search(r'\b(?:like|about|around|approximately|roughly)\s*$',text[:match.start()],re.I):continue
+        if destination_number(match,match.group(1) or match.group(3)):continue
         try:
             number=Decimal((match.group(1) or match.group(3)).replace(',',''))
             suffix=(match.group(2) or match.group(4) or '').lower()
@@ -160,10 +168,22 @@ def amount_clues(text):
                            'currency_hint':'NGN','currency_explicit':bool(match.group(1) or suffix=='naira')})
         except InvalidOperation:continue
     for match in FX_AMOUNT.finditer(text):
+        if destination_number(match,match.group(2)):continue
         number=Decimal(match.group(2).replace(',',''))
         if 0<number<=Decimal('1000000000000'):
             currency={'$':'USD','€':'EUR','£':'GBP'}.get(match.group(1),match.group(1).upper())
             result.append({'text':match.group(0)[:100],'amount':format(number,'f'),'currency_hint':currency,'currency_explicit':True})
+    explicit=[m.span() for pattern in (AMOUNT,FX_AMOUNT) for m in pattern.finditer(text)]
+    for match in SENTENCE_AMOUNT.finditer(text):
+        if destination_number(match,match.group(1)):continue
+        if any(start<match.end() and match.start()<end for start,end in explicit):continue
+        # Grouping plus a request cue or "to" makes this an amount, not a label.
+        if not (AMOUNT_REQUEST.search(text[:match.start()]) or re.match(r'\s+to\b',text[match.end():],re.I)):continue
+        if re.search(r'\b(?:like|about|around|approximately|roughly)\s*$',text[:match.start()],re.I):continue
+        number=Decimal(match.group(1).replace(',',''))
+        if 100<=number<=Decimal('1000000000000'):
+            result.append({'text':match.group(1),'amount':format(number,'f'),
+                           'currency_hint':None,'currency_explicit':False})
     return result[:10]
 
 # A short trailing run of punctuation/emoji ("395,000.", "395,000 ✅"), never prose.

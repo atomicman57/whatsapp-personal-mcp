@@ -21,6 +21,32 @@ def message(sequence=1,text='Please send NGN 12,500 for plumbing. Bank: Demo Ban
             'timestamp':NOW.isoformat(),'content':text,'is_from_me':False,'media_type':'','filename':'',**extra}
 
 class ClassifierTests(unittest.TestCase):
+    def test_grouped_amount_request_fragments(self):
+        for text,expected in (('send 2,500 to','2500'),('abeg 2,500 to','2500'),
+                              ('pls send 25,000 to','25000'),('2,500 to','2500'),
+                              ('₦2,500','2500'),('N2,500','2500'),('2,500 naira','2500')):
+            with self.subTest(text=text):
+                self.assertEqual([x['amount'] for x in amount_clues(text)],[expected])
+
+    def test_sentence_amounts_reject_labels_small_values_and_destinations(self):
+        texts=('retest 5','test 8','send 5 to','abeg 99 to','send N5 to',
+               'send 2,50 to','send 25,00 to','send 2,500,00 to','send 2,500.123 to',
+               'send -2,500 to','send abc2,500 to','retest 2,500','number 2,500',
+               'send 0123456789 to','send 012 345 6789 to',
+               'send 08031234567 to','send +234 803 123 4567 to',
+               'send 0 803-123-4567 to','send 0,803,123,4567 to',
+               'send 803,123,4567 to','send 2,348,031,234,567 to',
+               'send ₦0123456789 to','send N08031234567 to',
+               'send 0123456789 naira to','send 08031234567k to')
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertEqual(amount_clues(text),[])
+                result=classify(message(text=text+' 0123456789 Opay'))
+                self.assertEqual(result['amount_candidates'],[])
+        for text in ('send ₦5 to','send 5 naira to','send 5k to'):
+            with self.subTest(text=text):
+                self.assertTrue(amount_clues(text))
+
     def test_rates_acknowledgements_and_menus_never_request_or_supply_context(self):
         texts = ['Transfer 1415/1440', 'rate 1450', 'USD rate: 1450',
                  'I received 40k', 'received, thanks',

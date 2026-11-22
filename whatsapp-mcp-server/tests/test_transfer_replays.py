@@ -113,6 +113,33 @@ class ReplayTests(unittest.TestCase):
             self.events=[json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox ORDER BY rowid')]
         return self.events
 
+    def test_request_sentence_amounts_reach_cards(self):
+        cases=(('abeg 2,500 to 0123456789 Opay','2500'),
+               ('send 2,500 to 0123456789 Opay','2500'),
+               ('2,500 to 0123456789 Opay','2500'),
+               ('pls send 25,000 to 0123456789 Opay','25000'),
+               ('₦2,500 to 0123456789 Opay','2500'),
+               ('N2,500 to 0123456789 Opay','2500'),
+               ('2,500 naira to 0123456789 Opay','2500'),
+               ('SPEED1 send 1k 0123456789 Gt','1000'),
+               ('SPEED2 0123456789 Access',None),
+               ('SPEED3 abeg 2,500 to 0123456789 Opay','2500'),
+               ('SPEED4 0123456789 GTB 3k transport','3000'),
+               ('SPEED5 0123456789 Gt',None))
+        for index,(text,amount) in enumerate(cases):
+            with self.subTest(text=text):
+                chat=f'sentence-{index}@lid'
+                self.feed(text,chat=chat)
+                event=self.events[-1]
+                self.assertEqual(event['source']['chat_jid'],chat)
+                self.assertEqual(event['card']['account_number'],'0123456789')
+                self.assertEqual(self.amount(event),amount)
+                self.assertEqual([x['amount'] for x in event['candidate']['amount_candidates']],
+                                 [amount] if amount else [])
+                if amount:
+                    self.assertEqual(event['candidate']['amount_candidates'][0]['source_message_id'],
+                                     event['candidate']['source_message_ids'][-1])
+
     def test_label_numbers_never_supply_amount_alone_or_with_account(self):
         labels=('retest 5','test 8','item 2','no 3','#4','number 2500','arbitrary 2500',
                 'Please send 2500','2500 for parts','retest 2500')

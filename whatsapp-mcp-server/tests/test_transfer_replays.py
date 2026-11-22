@@ -99,7 +99,16 @@ class ReplayTests(unittest.TestCase):
         self.assert_update(before, after, '2500')
         self.assertEqual(self.amount(self.destinations()[WEMA]), '2500')
 
+    @unittest.expectedFailure
     def test_replay_04_caption_bank_then_late_amount(self):
+        """xfail: caption alone lacks the bank/request context required for an initial candidate."""
+        self.replay(4)
+        self.assertEqual(len(self.steps[0]), 1)
+        self.assertIsNone(self.amount(self.steps[0][0]))
+        self.assertEqual(len(self.latest()), 1)
+        self.assert_update(self.steps[2][-1], self.events[-1], '8500')
+
+    def test_replay_04_bank_context_then_amount_updates_same_key(self):
         self.replay(4)
         self.assertEqual(len(self.latest()), 1)
         before = self.steps[2][-1]

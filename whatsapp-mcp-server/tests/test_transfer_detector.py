@@ -21,6 +21,28 @@ def message(sequence=1,text='Please send NGN 12,500 for plumbing. Bank: Demo Ban
             'timestamp':NOW.isoformat(),'content':text,'is_from_me':False,'media_type':'','filename':'',**extra}
 
 class ClassifierTests(unittest.TestCase):
+    def test_rates_acknowledgements_and_menus_never_request_or_supply_context(self):
+        texts = ['Transfer 1415/1440', 'rate 1450', 'USD rate: 1450',
+                 'I received 40k', 'received, thanks',
+                 'Menu\nGas refill 15k\nRent a chair 2k',
+                 'Price list\nRice 5k\nDrinks 2k\n0123456789 Opay',
+                 'Price list\nPlease pay NGN 5,000 for rice\nDrinks 2k']
+        details = message(1, '0123456789 Opay Demo', timestamp=(NOW-timedelta(seconds=30)).isoformat())
+        for text in texts:
+            with self.subTest(text=text):
+                quote = message(2, text)
+                self.assertIsNone(classify(quote))
+                self.assertIsNone(classify(quote, [details]))
+                following = classify(message(3, '0123456789 Opay Demo'), [quote])
+                self.assertTrue(following['amount_missing'])
+        for text in ['40k Opay', 'NGN 40,000 Zenith', '1450 Wema']:
+            self.assertIsNone(classify(message(text=text)))
+        self.assertIsNotNone(classify(message(text='Please pay NGN 40k to 0123456789 Opay')))
+        self.assertIsNotNone(classify(message(text='I received the invoice, please pay NGN 40k')))
+        self.assertIsNotNone(classify(message(text='Please pay USD 100 at rate 1450 to 0123456789 Opay')))
+        self.assertIsNotNone(classify(message(text='Menu bill\nRice 5k\nTotal 5k\n0123456789 Opay')))
+
+
     def test_real_intake_shapes_with_synthetic_identifiers(self):
         compact=classify(message(text='0123456789 Moniepoint\nDemo Beneficiary 1900'))
         self.assertEqual([x['amount'] for x in compact['amount_candidates']],['1900'])
@@ -765,12 +787,12 @@ class WebhookTests(unittest.TestCase):
         for url in ['http://example.test/hook','https://u:p@example.test/hook','https://example.test/hook#secret']:
             with self.assertRaises(ValueError):Webhook(url,'Authorization','Bearer synthetic')
         hook=Webhook('https://example.test/hook','Authorization','Bearer synthetic')
-        with patch('transfer_detector.requests.post',return_value=Mock(status_code=302)) as post:
+        with patch.object(hook.session,'post',return_value=Mock(status_code=302)) as post:
             ok,code=hook.send('stable-id',{'payment_authorized':False})
             self.assertFalse(ok);self.assertEqual(code,'webhook_http_302')
             self.assertFalse(post.call_args.kwargs['allow_redirects'])
             self.assertEqual(post.call_args.kwargs['headers']['Idempotency-Key'],'stable-id')
-        with patch('transfer_detector.requests.post',side_effect=requests.ConnectionError('sensitive URL here')):
+        with patch.object(hook.session,'post',side_effect=requests.ConnectionError('sensitive URL here')):
             self.assertEqual(hook.send('stable-id',{}),(False,'webhook_network_error'))
     def test_compact_envelope_keeps_controls_first_and_complete_end_marker(self):
         payload={'event_id':'stable-id','event_type':'transfer_request_candidate','dry_run':True,

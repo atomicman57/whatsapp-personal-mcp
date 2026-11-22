@@ -190,3 +190,101 @@ revision events. Pause intake/delivery during rollback and reconcile queued
 revisions with the owner or retain a compatible receiver before resuming. Restoring
 DB backups requires explicit cursor/outbox dedupe reconciliation because it can
 replay accepted events. No deploy, restart or live send was run for this PR.
+
+## Receiver intake helper
+
+The bot owner can copy `scripts/trb_intake_post.py` to
+`/home/box/transfer-request-bot/intake_post.py`. This PR does not install it.
+Pass one complete webhook payload on stdin in one call:
+
+```sh
+python3 /home/box/transfer-request-bot/intake_post.py --state-dir /home/box/transfer-request-bot < payload.json
+python3 /home/box/transfer-request-bot/intake_post.py --state-dir /home/box/transfer-request-bot --archive --days 14
+```
+
+Use a private state directory. `requests.jsonl` contains private account details;
+keep it out of logs and source control. The helper stores no message text. Its
+stdout is compact JSON with `duplicate`, `applied`, a request summary and
+`related_requests`. Summaries contain request/event IDs, state, amount and account
+last four only. Related means the same source-account/chat requester or exact
+account within the last 14 days, configurable with `--days`. Related requests
+are evidence for review, never payment authority. The helper creates no cards,
+sends no messages and executes no payments. The owner must act only after a
+successful exit and `applied=true`.
+
+A shared file lock serializes callers and archiving. Same-directory atomic
+replacements and a durable redo journal recover an interrupted multi-file write
+on the next locked call. All readers/writers must use this lock; independently
+reading two files during a write does not provide a consistent snapshot. A
+repeated `event_id`, including one in the archive, does not apply twice. Upserts
+use `request_key`; predecessor tracking rejects delayed earlier revisions.
+A conflicting or missing predecessor on an existing request returns
+`review_required=true` and does not overwrite the known revision. Recorded
+conflicts require owner review; repeating the event does not reapply it.
+Unknown non-request events are recorded without creating a request. The compact
+event layout is `event_id,request_key,event_type,previous_event_id,at,applied,changed_fields`.
+
+Archive mode moves terminal requests (`completed`, `paid`, `rejected`, `cancelled`,
+`withdrawn`, `closed`) immediately, and other non-open requests older than the
+cutoff, into `archive/requests-YYYY-MM-DD.jsonl`. Open/pending/review/approved/
+processing requests stay live regardless of age. Events older than the cutoff
+move to `archive/events-YYYY-MM-DD.jsonl`; archived events still participate in
+deduplication and predecessor checks. Archives append safely on repeat runs.
+The helper initializes state as pending and applies detector withdrawals; any
+owner workflow that changes a request state must coordinate through the same
+`.intake.lock` and preserve the existing JSONL fields. This script provides no
+payment or approval state-transition interface.
+
+`candidate_updated.changed_fields` lists changed card field names, sorted for
+ordinary revisions. Account-name enrichment uses `["account_name"]`; the reason
+metadata also clears but is not a separate business change. Receivers can skip
+an account-name-only alert while still upserting the latest revision. The
+snapshot survives delivered-payload cleanup and restarts. On the first update
+of a legacy request without a snapshot, fields are conservatively reported as
+changed. Webhook POSTs reuse one requests Session with HTTPS keep-alive and
+connect/read timeouts of 3/5 seconds. Idempotency keys and backoff are unchanged.
+
+## Attempt-4 deployment procedure for the next authorized release
+
+These are instructions for a separately authorized deployment. Creating this PR
+does not authorize a deploy, service restart or WhatsApp send.
+
+1. Capture both accounts' current image selectors, public route status codes,
+   authenticated MCP tool lists and health/status baselines. Take a **fresh**
+   timestamped `cp -a` backup of configuration, units and complete state/data
+   directories, preserving modes and ownership. Take consistent SQLite online
+   snapshots while running and stopped copies immediately before each cutover.
+   Keep credentials, sessions, tokens, environment and identities unchanged.
+2. Before each cutover, verify the detector cursor is **less than or equal to
+   the bridge durable-feed head**. Compare historical outbox IDs on stable
+   business columns only: `source,payload,attempts,next_attempt,delivered,created`.
+   Refresh that baseline immediately before switching while stopped. Ignore
+   migration defaults/new telemetry columns and assess new rows separately.
+   Stop on a real changed/missing historical row or an incompatible cursor.
+3. Deploy **secondary first** as the canary. Swap its image selector only. Start
+   or restart bridge, then tunnel, then detector. Keep MAIN serving. Observe
+   secondary for **10 minutes** before proceeding to MAIN. Require every gate
+   below throughout the observation. Then repeat the cursor/baseline check,
+   cutover and gates on MAIN, keeping secondary serving.
+4. Require private local `/api/health` on port **8753** to return 200 with the
+   bridge connected/logged in. Require active bridge/tunnel/detector units,
+   detector `stream_connected=true`, no gap, no read/delivery errors, compatible
+   feed head/cursor and no historical replay, resend or mark-read operation.
+   Require public route status-code parity with the captured baseline. A public
+   `/api/health` returning baseline 404 is not the private health gate.
+5. Query the authenticated public MCP endpoint. `tools/list` must include
+   **record_intake_stage** and **get_transfer_latency_report**. Call the latter
+   successfully and verify detector `/status` telemetry. Source code alone
+   does not prove that the deployed endpoint exposes the tools.
+6. Roll back only for real health failures, gaps, broken public routes or real
+   historical row changes. **Swap only the image back**, retaining all live
+   bridge/detector databases, sessions, cursor, dedupe and delivery state.
+   **Never restore an older `messages.db`**, even from the fresh backup. Recheck
+   cursor <= feed head, restart bridge, tunnel, detector in that order, and
+   repeat all health gates. Stop and reconcile an incompatible feed/cursor;
+   never rewind the cursor or replay history to hide a gap.
+
+A missing owner stage is not a rollback trigger. Webhook acceptance alone does
+not establish card creation or owner delivery. Any later live synthetic test
+requires separate WhatsApp-send authorization; do not run `e2e_latency.py --send`
+as part of preparing or reviewing this PR.

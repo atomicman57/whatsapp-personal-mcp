@@ -13,7 +13,7 @@ SYNTHETIC = re.compile(r'\b(?:synthetic|test only|sample account|example test ba
 # Past-tense confirmation that a payment happened; settles a chat's pending split.
 # A pre-payment ask ("please send the receipt after you pay") is not settlement.
 SETTLED = re.compile(r"\b(?:payment (?:successful|received|completed|confirmed)|transfer (?:successful|completed)|transaction successful|"
-                     r"money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
+                     r"(?:i|we) (?:have )?received\s+(?:NGN\s*|₦\s*)?\d[\d,.]*(?:k|m| naira)?|received[,!]?\s+thanks|money (?:received|has arrived)|(?:already|just|i['’]ve|i have|we['’]ve|we have|has been) (?:paid|transferred|sent it)|"
                      r"(?:here['’]?s|here is|attached is|find attached) (?:the |my |your )?(?:receipt|proof of payment)|(?:receipt|proof of payment) attached)\b",re.I)
 # "if/when/until/once/unless/not/n't" shortly before the phrase, in the same
 # sentence, makes it a condition or denial ("notify me if payment successful").
@@ -127,7 +127,7 @@ def recent_context(source,context,dry_run=False):
         if dry_run:
             if not body.startswith(TEST_PREFIX):continue
             body=body[len(TEST_PREFIX):]
-        if not sensitive(body) and not SYNTHETIC.search(body):result.append({**row,'content':body})
+        if not sensitive(body) and not SYNTHETIC.search(body) and not non_request(body):result.append({**row,'content':body})
     return result
 
 def total_clue(text):
@@ -217,8 +217,15 @@ def settled(text):
 def sensitive(text):
     return bool(SECURITY.search(text or ''))
 
+def non_request(text):
+    """Rate quotations and advertised menus cannot anchor or complete a request."""
+    if re.search(r'\b(?:rate|exchange rate)\s*[:=@-]?\s*\d',text,re.I) and not account_clues(text):return True
+    if re.search(r'\b(?:transfer|buy|sell)\s+\d+(?:\.\d+)?\s*/\s*\d+',text,re.I):return True
+    if re.search(r'\b(?:price list|menu|our prices)\b',text,re.I) and not total_clue(text):return True
+    return False
+
 def request_language(text):
-    return bool(ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
+    return bool(not non_request(text) and ACTION.search(text) and (MONEY.search(text) or amount_clues(text)))
 
 def linked_amount(source,ordered,accounts,skip_id,window,exclusions):
     """Nearest earlier incoming amount for destination-only details: (amounts, from_excluded).
@@ -264,7 +271,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if text.startswith(TEST_PREFIX):
         if not dry_run:return None
         text=text[len(TEST_PREFIX):]
-    if excluded(source,text,exclusions):return None
+    if excluded(source,text,exclusions) or non_request(text):return None
     context=recent_context(source,context,dry_run)
     window=timedelta(seconds=link_window)
     ordered=[]

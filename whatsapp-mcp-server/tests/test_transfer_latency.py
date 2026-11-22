@@ -113,12 +113,15 @@ class LatencyTests(unittest.TestCase):
 
     def test_webhook_idempotency_header_and_real_http_status(self):
         webhook = Webhook('https://example.invalid/wake', 'X-Owner-Key', 'synthetic-key')
-        with patch('transfer_detector.requests.post', return_value=Mock(status_code=202)) as post:
+        with patch.object(webhook.session, 'post', return_value=Mock(status_code=202)) as post:
             for _ in range(2):
                 self.assertEqual(webhook.send('synthetic-event', {'payment_authorized': False}), (True, None))
             self.assertEqual(post.call_args.kwargs['headers']['Idempotency-Key'], 'synthetic-event')
             self.assertFalse(post.call_args.kwargs['allow_redirects'])
             self.assertEqual(webhook.last_status, 202)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(post.call_args.kwargs['timeout'], (3, 5))
+            self.assertFalse(webhook.session.trust_env)
 
     def test_telemetry_attempts_persist_and_end_to_end_requires_owner_stage(self):
         stamp = milliseconds()
@@ -206,9 +209,20 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual(updated['request_key'],first['request_key'])
         self.assertEqual(updated['previous_event_id'],first['event_id'])
         self.assertEqual(updated['card']['account_name'],'Verified Demo')
+        self.assertEqual(updated['changed_fields'], ['account_name'])
         self.state.cancel_held(first['source']['chat_jid'])
         self.state.enriched(updated, updated['event_id'])
         self.assertEqual([p['event_type'] for p in self.pending()],['candidate_withdrawn'])
+
+    def test_changed_fields_survive_delivered_payload_cleanup_and_restart(self):
+        first = self.add(message())[1]
+        self.detector.deliver_one()
+        self.state = State(self.root)
+        self.detector.state = self.state
+        self.add(message(2, 'Please send NGN 15,000 for plumbing. Bank: Demo Bank. Account 0123456789.', id='message-1'))
+        updated = self.state.due()[1]
+        self.assertEqual(updated['previous_event_id'], first['event_id'])
+        self.assertEqual(updated['changed_fields'], ['amount'])
 
     def test_migration_releases_legacy_hold_without_changing_claim(self):
         key = self.add(message())[0]

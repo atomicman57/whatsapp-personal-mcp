@@ -63,7 +63,8 @@ class NameEnquiry:
         if name:
             card.update(account_name=name, account_name_reason=None)
             payload.update(event_id=digest(row[0], 'name-enquiry', name), event_type='candidate_updated',
-                           previous_event_id=row[0], revision_hint='replace_card_for_request_key')
+                           previous_event_id=row[0], revision_hint='replace_card_for_request_key',
+                           changed_fields=['account_name'])
             self.state.enriched(payload, row[0])
         with self.state.lock, self.state.db() as db:
             db.execute("UPDATE name_enquiries SET status=?,payload=NULL WHERE event_id=?",

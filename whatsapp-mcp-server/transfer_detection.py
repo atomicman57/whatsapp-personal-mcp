@@ -22,7 +22,7 @@ UNSETTLED = re.compile(r"\b(?:if|when|until|once|unless|not)\b|n['’]t\b",re.I)
 RECEIPT = re.compile(SETTLED.pattern+r"|\b(?:send (?:me )?(?:the )?receipt|proof of payment|transaction reference)\b",re.I)
 ACTION = re.compile(r'\b(?:please|pls|kindly|abeg|send|transfer|pay|borrow|lend|assist|help me|i need|we need|balance|settle|deposit|owe)\b',re.I)
 MONEY = re.compile(r'\b(?:money|funds|naira|ngn|usd|eur|gbp|rent|loan|gas|school fees|bill|payment|acct|account|bank)\b|[₦$€£]',re.I)
-BANK = re.compile(r'\b(?:bank|acct|account number|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
+BANK = re.compile(r'\b(?:bank|acct|account(?: number)?|uba|gtbank|gtb|gtco|guaranty trust|zenith|moniepoint|o\s*pay|palmpay|kuda|wema|alat|fcmb|fidelity|access|first\s*bank|stanbic|sterling|union bank|ecobank|polaris|keystone|providus|titan|optimus|globus|premium trust)\b',re.I)
 AMOUNT = re.compile(r'(?:₦|\bNGN\s*|\bN(?=\s*\d))\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million)?\b|(?<!\d)(\d[\d,]*(?:\.\d{1,2})?)\s*(k|m|thousand|million|naira)\b',re.I)
 BARE_AMOUNT = re.compile(r'\b(?:send|transfer|pay|need|borrow|lend|owe|balance|total)\s+(?:me\s+)?(\d[\d,]*(?:\.\d{1,2})?)\b',re.I)
 FX_AMOUNT = re.compile(r'(USD|EUR|GBP|\$|€|£)\s*(\d[\d,]*(?:\.\d{1,2})?)',re.I)
@@ -35,7 +35,7 @@ STANDALONE_TOTAL = re.compile(r'^[ \t]*(?:grand[ \t]+)?total[ \t]*[:=\-]*[ \t]*(
 # "U.B.A", "u b a", "G.T.B." -> acronym, only when the letters spell a known bank.
 DOTTED_ACRONYM = re.compile(r'(?<![A-Za-z0-9])[A-Za-z](?:(?:[ \t]*\.[ \t]*|[ \t]+)[A-Za-z]){1,3}\.?(?![A-Za-z0-9])')
 BANK_ACRONYMS = {'UBA','GTB','GTCO','FCMB'}
-GENERIC_BANK_TOKENS = {'bank','acct','account number'}
+GENERIC_BANK_TOKENS = {'bank','acct','account','account number'}
 LINK_WINDOW_SECONDS = 900
 MAX_LINK_WINDOW_SECONDS = 7200
 EXCLUSION_DELIMITER = '||'
@@ -105,7 +105,11 @@ def account_clues(text):
     phones=[x.span() for x in PHONE.finditer(text)]
     found=(re.sub(r'\D','',x.group(0)) for x in ACCOUNT.finditer(text)
            if not any(start<=x.start() and x.end()<=end for start,end in phones))
-    return list(dict.fromkeys(found))[:10]
+    accounts=list(found)
+    # Only contiguous local mobile-shaped accounts with explicit wallet/account wording.
+    if re.search(r'\b(?:o\s*pay|palmpay|moniepoint|kuda|acct|account)\b',text,re.I):
+        accounts.extend(x.group(0) for x in re.finditer(r'(?<![\w+])0[789]\d{9}(?!\d)',text))
+    return list(dict.fromkeys(accounts))[:10]
 
 def age(source,row):
     try:

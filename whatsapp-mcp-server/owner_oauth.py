@@ -246,6 +246,33 @@ class OwnerOAuthProvider:
         value = AccessToken(token=token, **json.loads(row['data']))
         return value if value.resource == self.resource else None
 
+    async def event_owner(self, token):
+        """Bind subscriptions to the existing OAuth grant, never store access tokens.
+
+        Maintenance bearer clients retain normal tools but cannot create persistent
+        event subscriptions. Rotations keep the family; revocation stops delivery.
+        """
+        access = await self.load_access_token(token)
+        if not access or access.subject != 'owner' or SCOPE not in access.scopes:
+            return None
+        with self.db() as db:
+            row = self.row(db, 'access', token)
+        if not row or not row['family']:
+            return None
+        return json.dumps([row['client'], row['family']], separators=(',', ':'))
+
+    def event_owner_active(self, owner):
+        try:
+            client, family = json.loads(owner)
+            if not isinstance(client, str) or not isinstance(family, str):
+                return False
+        except (ValueError, TypeError):
+            return False
+        with self.db() as db:
+            rows = db.execute('SELECT data FROM grants WHERE client=? AND family=? AND active=1 '
+                              'AND kind="refresh" AND expires>?', (client, family, time.time())).fetchall()
+        return any(SCOPE in json.loads(row['data']).get('scopes', []) for row in rows)
+
     async def revoke_token(self, token):
         with self.db() as db:
             row = db.execute('SELECT family FROM grants WHERE digest=? AND kind IN ("access","refresh")', (digest(token.token),)).fetchone()

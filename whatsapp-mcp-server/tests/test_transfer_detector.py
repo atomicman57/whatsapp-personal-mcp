@@ -527,24 +527,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(payload['source']['id'],'synthetic-chef-4')
         self.assertEqual(payload['candidate']['source_message_ids'],['synthetic-chef-3','synthetic-chef-4'])
         self.assertEqual(payload['candidate']['amount_candidates'][0]['amount'],'51500')
-    def test_account_first_split_queues_one_completed_card(self):
+    def test_account_first_split_emits_immediately_then_updates_same_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,ACCOUNT_UBA,minutes_ago=1));self.detector.drain()
-        # The destination-only card is held for the link window, not delivered.
-        self.assertEqual(self.state.status()['queued_notifications'],1)
-        self.assertIsNone(self.state.due());self.assertFalse(self.detector.deliver_one())
+        initial=self.state.due()[1]
+        self.assertTrue(initial['candidate']['amount_missing'])
+        self.assertTrue(self.detector.deliver_one())
         restarted=Detector(State(self.directory.name),self.bridge,self.hook,'synthetic-instance','15550000001')
-        restarted.initialize();restarted.drain()
-        self.assertIsNone(self.state.due())
+        restarted.initialize()
         self.add(chef(2,KITCHEN));restarted.drain()
-        self.assertEqual(self.state.status()['queued_notifications'],1)
         payload=self.state.due()[1]
+        self.assertEqual(payload['event_type'],'candidate_updated')
+        self.assertEqual(payload['previous_event_id'],initial['event_id'])
+        self.assertEqual(payload['request_key'],initial['request_key'])
         self.assertFalse(payload['candidate']['amount_missing'])
-        self.assertEqual(payload['candidate']['source_message_ids'],['synthetic-chef-1','synthetic-chef-2'])
         self.assertEqual(payload['candidate']['amount_candidates'][0]['amount'],'51500')
-        self.assertEqual(payload['request_key'],digest('synthetic-instance',CHEF,'synthetic-chef-1'))
-        self.assertTrue(restarted.deliver_one());self.assertFalse(restarted.deliver_one())
-        self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
+        restarted.deliver_one()
+        cards={}
+        seen=set()
+        for key,event in self.hook.calls+self.hook.calls:
+            if key in seen:continue
+            seen.add(key);cards[event['request_key']]=event['card']
+        self.assertEqual(len(cards),1)
+        self.assertEqual(cards[initial['request_key']]['amount']['value'],'51500')
     def test_meat_market_quote_bare_total_and_account_queue_one_completed_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         for row in vendor_sequence(STANBIC_NEWLINES):self.add(row)
@@ -561,16 +566,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(candidate['bank_name_candidates'],['Stanbic'])
         self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
         self.assertEqual([x[1]['candidate']['amount_missing'] for x in self.hook.calls],[False])
-    def test_account_first_then_bare_total_replaces_held_card(self):
+    def test_account_first_then_bare_total_keeps_initial_and_revision(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
-        self.assertIsNone(self.state.due())
+        first=self.state.due()[1]
         self.add(vendor(2,'395,000'));self.detector.drain()
-        self.assertEqual(self.state.status()['queued_notifications'],1)
-        candidate=self.state.due()[1]['candidate']
-        self.assertFalse(candidate['amount_missing'])
-        self.assertEqual(candidate['amount_candidates'][0]['amount'],'395000')
-        self.assertEqual(candidate['account_number_candidates'],['0063417132'])
+        self.assertEqual(self.state.status()['queued_notifications'],2)
+        self.detector.deliver_one()
+        updated=self.state.due()[1]
+        self.assertEqual(updated['previous_event_id'],first['event_id'])
+        self.assertEqual(updated['event_type'],'candidate_updated')
+        self.assertEqual(updated['card']['amount']['value'],'395000')
     def test_account_then_year_code_digit_or_phone_reply_stays_amount_missing(self):
         for text in ('2026','123456','5','08031234567'):
             self.setUp()
@@ -580,7 +586,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(self.state.status()['queued_notifications'],1,text)
             with self.state.db() as db:
                 (payload,held),=db.execute('SELECT payload,held FROM outbox WHERE delivered IS NULL').fetchall()
-            self.assertEqual(held,1,text)
+            self.assertEqual(held,0,text)
             self.assertEqual(json.loads(payload)['source']['id'],'synthetic-vendor-1',text)
             self.assertTrue(json.loads(payload)['candidate']['amount_missing'],text)
     def test_account_then_small_or_real_amount_reply_completes(self):
@@ -589,27 +595,25 @@ class RuntimeTests(unittest.TestCase):
             self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
             self.add(vendor(1,STANBIC_SLASHES,minutes_ago=1));self.detector.drain()
             self.add(vendor(2,text));self.detector.drain()
-            self.assertEqual(self.state.status()['queued_notifications'],1,text)
+            self.assertEqual(self.state.status()['queued_notifications'],2,text)
+            self.detector.deliver_one()
             candidate=self.state.due()[1]['candidate']
             self.assertFalse(candidate['amount_missing'],text)
             self.assertEqual([x['amount'] for x in candidate['amount_candidates']],[amount],text)
             self.assertEqual(candidate['account_number_candidates'],['0063417132'],text)
-    def test_receipt_cancels_only_that_chats_unsent_held_card(self):
+    def test_receipt_cancels_only_that_chats_unsent_rows_and_emits_withdrawal(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
         self.detector.drain()
-        self.assertEqual(self.state.status()['queued_notifications'],2);self.assertIsNone(self.state.due())
-        for sequence,text,extra in ((3,'Payment successful',{}),(4,'Already paid, send the receipt',{'is_from_me':True})):
-            self.add(vendor(sequence,text,minutes_ago=1,**extra));self.detector.drain()
-            with self.state.db() as db:
-                left=[json.loads(x[0])['source']['chat_jid'] for x in db.execute('SELECT payload FROM outbox WHERE delivered IS NULL')]
-            self.assertEqual(left,[CHEF])
-        # The other chat's split still completes normally.
-        self.add(chef(5,KITCHEN));self.detector.drain()
-        payload=self.state.due()[1]
-        self.assertEqual(payload['source']['chat_jid'],CHEF)
-        self.assertFalse(payload['candidate']['amount_missing'])
-        self.assertEqual(self.state.status()['queued_notifications'],1)
+        self.add(vendor(3,'Payment successful',minutes_ago=1));self.detector.drain()
+        with self.state.db() as db:
+            left=[json.loads(x[0]) for x in db.execute('SELECT payload FROM outbox WHERE delivered IS NULL')]
+        self.assertEqual(len(left),2)
+        self.assertEqual(left[0]['source']['chat_jid'],CHEF)
+        self.assertEqual(left[1]['event_type'],'candidate_withdrawn')
+        self.assertFalse(left[1]['payment_authorized'])
+        self.add(vendor(4,'Already paid',is_from_me=True));self.detector.drain()
+        self.assertEqual(self.state.status()['queued_notifications'],2)
     def test_pre_payment_receipt_requests_do_not_cancel_held_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
@@ -690,7 +694,7 @@ class RuntimeTests(unittest.TestCase):
         current=self.state.attempt_started(key);self.assertTrue(current)
         self.state.failed(key,0,'webhook_network_error',stale)
         with self.state.db() as db:
-            self.assertEqual(db.execute('SELECT first_attempt,attempts FROM outbox WHERE id=?',(key,)).fetchone(),(current,0))
+            self.assertEqual(db.execute('SELECT first_attempt,attempts FROM outbox WHERE id=?',(key,)).fetchone(),(current,2))
     def test_card_cancelled_after_due_is_not_sent(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.detector.drain()
@@ -700,22 +704,17 @@ class RuntimeTests(unittest.TestCase):
             item=due();self.state.cancel_held(VENDOR);return item
         with patch.object(self.state,'due',due_then_cancelled):self.assertTrue(self.detector.deliver_one())
         self.assertEqual(self.hook.calls,[])
-        self.assertEqual(self.state.status()['queued_notifications'],0)
-    def test_split_completion_or_timeout_in_one_chat_leaves_other_chats_held_card(self):
+        self.assertEqual(self.state.due()[1]['event_type'],'candidate_withdrawn')
+    def test_split_completion_keeps_other_chats_immediate_card(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(vendor(1,STANBIC_NEWLINES,minutes_ago=3));self.add(chef(2,ACCOUNT_UBA,minutes_ago=2))
         self.detector.drain()
-        vendor_held=self.state.seen(digest('synthetic-instance',VENDOR,'synthetic-vendor-1'))[1]
         self.add(chef(3,KITCHEN));self.detector.drain()
-        with self.state.db() as db:
-            rows=dict(db.execute('SELECT id,held FROM outbox WHERE delivered IS NULL').fetchall())
-        self.assertEqual(rows[vendor_held],1);self.assertEqual(len(rows),2)
-        # The completed chef card goes out; the vendor card stays held until its own window ends.
-        self.assertTrue(self.detector.deliver_one());self.assertFalse(self.detector.deliver_one())
-        self.assertEqual(self.hook.calls[0][1]['source']['chat_jid'],CHEF)
-        with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0 WHERE id=?',(vendor_held,))
-        self.assertTrue(self.detector.deliver_one())
-        self.assertEqual(self.hook.calls[1][0],vendor_held)
+        self.assertEqual(self.state.status()['queued_notifications'],3)
+        while self.detector.deliver_one():pass
+        self.assertEqual(len(self.hook.calls),3)
+        self.assertEqual(self.hook.calls[0][1]['source']['chat_jid'],VENDOR)
+        self.assertEqual(self.hook.calls[2][1]['event_type'],'candidate_updated')
     def test_amount_first_split_still_queues_one_card_immediately(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,KITCHEN,minutes_ago=1));self.add(chef(2,ACCOUNT_UBA));self.detector.drain()
@@ -730,18 +729,16 @@ class RuntimeTests(unittest.TestCase):
         # A held card becomes due when its window ends and is never replaced once sent.
         self.detector.link_window=60
         self.add(chef(2,'0123456789 Opay Vendor One'));self.detector.drain()
-        self.assertEqual(self.state.status()['queued_notifications'],1);self.assertIsNone(self.state.due())
+        self.assertEqual(self.state.status()['queued_notifications'],1);self.assertIsNotNone(self.state.due())
         with self.state.db() as db:db.execute('UPDATE outbox SET next_attempt=0')
         while self.detector.deliver_one():pass
         self.add(chef(3,'Total= 9,000'));self.detector.drain()
         self.assertEqual(len(self.hook.calls),2);self.assertEqual(self.state.status()['queued_notifications'],1)
-    def test_edit_of_held_destination_replaces_unsent_card(self):
+    def test_source_withdrawal_cancels_unsent_candidate(self):
         self.state.set(go_live=(NOW-timedelta(minutes=30)).isoformat())
         self.add(chef(1,ACCOUNT_UBA,minutes_ago=1));self.detector.drain()
-        held=self.state.seen(digest('synthetic-instance',CHEF,'synthetic-chef-1'))[1]
         self.add(chef(2,'Ok',id='synthetic-chef-1',minutes_ago=1));self.detector.drain()
-        with self.state.db() as db:
-            self.assertIsNone(db.execute('SELECT id FROM outbox WHERE id=?',(held,)).fetchone())
+        self.assertEqual(self.state.status()['queued_notifications'],1)
         self.assertEqual(self.state.due()[1]['event_type'],'source_changed')
     def test_dry_run_requires_exact_owner_sender(self):
         text=TEST_PREFIX+' Please send NGN 12,500 to Example Test Bank account 0123456789'

@@ -43,6 +43,21 @@ class ClassifierTests(unittest.TestCase):
         self.assertIsNotNone(classify(message(text='Menu bill\nRice 5k\nTotal 5k\n0123456789 Opay')))
 
 
+    def test_prices_and_market_quotes_never_supply_split_amounts(self):
+        details = message(2, 'Account: 0123456789 Wema')
+        for text in ('price na 5k for market', 'Price is NGN 5000, available in stock', '5k in the market'):
+            with self.subTest(kind=text):
+                quote = message(1, text, timestamp=(NOW-timedelta(seconds=30)).isoformat())
+                self.assertIsNone(classify(quote, [details]))
+                result = classify(details, [quote])
+                self.assertEqual(result['amount_candidates'], [])
+                later = message(3, text, timestamp=(NOW+timedelta(seconds=30)).isoformat())
+                self.assertIsNone(classify(later, [details]))
+        payment = message(3, 'Please send 5k for market', timestamp=(NOW+timedelta(seconds=30)).isoformat())
+        result = classify(payment, [details])
+        self.assertEqual(result['amount_candidates'][0]['amount'], '5000')
+        self.assertEqual(result['anchor_message_id'], details['id'])
+
     def test_real_intake_shapes_with_synthetic_identifiers(self):
         compact=classify(message(text='0123456789 Moniepoint\nDemo Beneficiary 1900'))
         self.assertEqual([x['amount'] for x in compact['amount_candidates']],['1900'])
@@ -496,6 +511,53 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(updated['previous_event_id'], first['event_id'])
                 self.assertEqual(updated['changed_fields'], ['amount'])
                 self.assertEqual(updated['card']['amount']['value'], '6000')
+
+    def test_test8_unrelated_chat_price_and_phone_preserve_pending_account(self):
+        lines = ('Account: 0123456789 Wema test 8', 'how far', 'I dey come', 'ok',
+                 '08000000008', 'price na 5k for market', 'send 8k for the test 8 account')
+        for sequence, text in enumerate(lines, 1):
+            self.add(message(sequence, text, timestamp=(NOW+timedelta(seconds=sequence-1)).isoformat()))
+            self.detector.drain()
+            if sequence < len(lines):
+                initial, = self.queued_payloads()
+                self.assertEqual(initial['event_type'], 'transfer_request_candidate')
+                self.assertIsNone(initial['card']['amount'])
+                self.assertEqual(initial['card']['account_number'], '0123456789')
+        first, updated = self.queued_payloads()
+        self.assertEqual({first['request_key'], updated['request_key']}, {first['request_key']})
+        self.assertEqual(updated['event_type'], 'candidate_updated')
+        self.assertEqual(updated['revision'], 2)
+        self.assertEqual(updated['previous_event_id'], first['event_id'])
+        self.assertEqual(updated['changed_fields'], ['amount'])
+        self.assertEqual(updated['card']['amount']['value'], '8000')
+        self.assertEqual(updated['candidate']['amount_candidates'][0]['source_message_id'], 'message-7')
+
+    def test_test9_later_amount_at_180_and_900_seconds_updates_same_request(self):
+        for seconds in (180, 900):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                self.add(message(1, 'Account: 0987654321 Wema test 9'))
+                self.detector.drain()
+                self.add(message(2, 'test 9, 9k', timestamp=(NOW+timedelta(seconds=seconds)).isoformat()))
+                self.detector.drain()
+                first, updated = self.queued_payloads()
+                self.assertIsNone(first['card']['amount'])
+                self.assertEqual(first['event_type'], 'transfer_request_candidate')
+                self.assertEqual(updated['request_key'], first['request_key'])
+                self.assertEqual(updated['event_type'], 'candidate_updated')
+                self.assertEqual(updated['revision'], 2)
+                self.assertEqual(updated['previous_event_id'], first['event_id'])
+                self.assertEqual(updated['changed_fields'], ['amount'])
+                self.assertEqual(updated['card']['amount']['value'], '9000')
+
+    def test_test9_later_amount_at_901_seconds_does_not_attach(self):
+        self.add(message(1, 'Account: 0987654321 Wema test 9'))
+        self.detector.drain()
+        initial, = self.queued_payloads()
+        self.assertIsNone(initial['card']['amount'])
+        self.add(message(2, 'test 9, 9k', timestamp=(NOW+timedelta(seconds=901)).isoformat()))
+        self.detector.drain()
+        self.assertEqual(self.queued_payloads(), [initial])
 
     def test_consumed_amount_fragment_survives_delivery_restart_and_same_account(self):
         self.add(message(1, '6k'))

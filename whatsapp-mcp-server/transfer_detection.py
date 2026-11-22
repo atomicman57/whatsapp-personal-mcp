@@ -218,7 +218,8 @@ def sensitive(text):
     return bool(SECURITY.search(text or ''))
 
 def non_request(text):
-    """Rate quotations and advertised menus cannot anchor or complete a request."""
+    """Prices, rate quotations and advertised menus cannot complete a request."""
+    if re.search(r"\bprice\b|\b(?:at|in|for)\s+(?:the\s+)?market\b",text,re.I) and not re.search(r"\b(?:send|transfer|pay|deposit|owe|settle)\b",text,re.I):return True
     if re.search(r'\b(?:rate|exchange rate)\s*[:=@-]?\s*\d',text,re.I) and not account_clues(text):return True
     if re.search(r'\b(?:transfer|buy|sell)\s+\d+(?:\.\d+)?\s*/\s*\d+',text,re.I):return True
     if re.search(r'\b(?:price list|menu|our prices)\b',text,re.I) and not total_clue(text):return True
@@ -303,6 +304,7 @@ def classify(source,context=(),dry_run=False,link_window=LINK_WINDOW_SECONDS,exc
     if accounts and has_bank(text) and not total_clue(text):
         # Account/name/"1900" and itemized "total-48,500" are actual intake formats.
         for match in list(TOTAL.finditer(text))+list(re.finditer(r'(?<![\d,])(\d[\d,]*(?:\.\d{1,2})?)\s*$',text)):
+            if re.search(r'\btest\s*$',text[:match.start(1)],re.I):continue
             value=match.group(1).replace(',','')
             if re.match(r'\s*(?:k|m|thousand|million|naira)\b',text[match.end(1):],re.I):continue
             if len(value.split('.')[0])==10 or any(match.start(1)>=a.start() and match.end(1)<=a.end() for a in ACCOUNT.finditer(text)):continue

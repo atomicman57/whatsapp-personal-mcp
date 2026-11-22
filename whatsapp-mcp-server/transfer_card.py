@@ -24,6 +24,9 @@ def card_for(row, clues, aliases, rows):
         text = item.get('content') or ''
         match = re.search(r'\bfor\s+(.{1,240})', text, re.I)
         if match:
+            # A destination reference identifies the request, not its purpose.
+            if re.fullmatch(r'(?:(?:the|this|that)\s+)?(?:test\s+\d+\s+)?(?:acct|account)[.!?\s]*', match[1], re.I):
+                continue
             purpose = re.split(r'[.;\n]|\b(?:bank|acct|account)\b|\d{10,}', match[1], maxsplit=1, flags=re.I)[0].strip()[:240] or None
         elif re.match(r'^(?:waybill|drinks|delivery|transport|gas|fuel|rent|school fees|plumbing)\b', text, re.I):
             purpose = text[:240]

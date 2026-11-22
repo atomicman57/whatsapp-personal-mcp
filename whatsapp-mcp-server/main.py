@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Callable, Optional
 from mcp.server.fastmcp import FastMCP
 from macos_contacts import contacts_app_status as macos_contacts_app_status
+from intake_alerts import delete_intake_alert, list_intake_alerts
 from direct_sending import send_message, send_file, send_audio_message
 from replies import reply_message
 from workflow_reads import export_chat, list_chat_state, get_message_status, get_contact_details, list_new_messages, download_profile_photo
@@ -50,6 +51,8 @@ else:
     mcp = FastMCP("whatsapp")
 
 mcp.tool()(reply_message)
+mcp.tool()(delete_intake_alert)
+mcp.tool()(list_intake_alerts)
 mcp.tool()(send_message)
 mcp.tool()(send_file)
 mcp.tool()(send_audio_message)

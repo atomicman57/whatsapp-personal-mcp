@@ -1215,6 +1215,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, event
 	registerReplyHandlers(mux, client, messageStore, eventBroker)
 	registerContactWorkflow(mux, client, messageStore)
 	registerDetectorReadHandlers(mux, client, messageStore)
+	if err := registerIntakeAlerts(mux, client, messageStore); err != nil {
+		return nil, err
+	}
 
 	// Health is read-only and reports both live connectivity and local cache age.
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {

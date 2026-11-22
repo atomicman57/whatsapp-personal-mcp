@@ -11,6 +11,17 @@ from urllib.parse import urlsplit
 from mcp_events import RESOLVER
 
 
+def claimed_name(text):
+    """Explicit self-introductions only; a bank beneficiary is never a requester."""
+    pattern = r"(?i:\bthis is|\bmy name is|(?:^|[.!?\n])\s*from)\s+([A-Z][A-Za-z'-]{1,29}(?:[ \t]+[A-Z][a-zA-Z'-]{1,29}){0,2})(?=[,.;!?\n]|$)"
+    matches = [m[1].strip() for m in re.finditer(pattern, text or '')]
+    # Explicit separators keep 'from Ada account ...' and sentence prose out.
+    names = list(dict.fromkeys(matches))
+    if len(names) != 1 or re.search(r'\b(?:bank|account|acct|please|send|transfer|pay|support|customer|unknown)\b', names[0], re.I):
+        return None
+    return names[0]
+
+
 def card_for(row, clues, aliases, rows):
     accounts = clues.get('account_number_candidates', [])
     banks = clues.get('bank_name_candidates', [])
@@ -30,7 +41,13 @@ def card_for(row, clues, aliases, rows):
             purpose = re.split(r'[.;\n]|\b(?:bank|acct|account)\b|\d{10,}', match[1], maxsplit=1, flags=re.I)[0].strip()[:240] or None
         elif re.match(r'^(?:waybill|drinks|delivery|transport|gas|fuel|rent|school fees|plumbing)\b', text, re.I):
             purpose = text[:240]
-    return {'requester_display_name': saved_name or (row.get('chat_name') or 'Unknown requester')[:120],
+    introductions = [claimed_name(item.get('content')) for item in rows + [row]
+                     if item['id'] in clues.get('source_message_ids', []) and not item.get('is_from_me')]
+    introductions = list(dict.fromkeys(x for x in introductions if x))
+    return {'claimed_name': introductions[0] if len(introductions) == 1 else None,
+            'whatsapp_contact_name': saved_name,
+            'whatsapp_push_name': aliases.get('push_name') or row.get('push_name'),
+            'requester_display_name': saved_name or (row.get('chat_name') or 'Unknown requester')[:120],
             'amount': ({'value': amounts[0]['amount'], 'currency': amounts[0].get('currency_hint')}
                        if amounts and not clues.get('amount_ambiguous') else None),
             'bank': banks[0][:80] if len(banks) == 1 else None,

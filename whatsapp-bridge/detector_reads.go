@@ -212,6 +212,7 @@ func registerDetectorReadHandlers(mux *http.ServeMux, client *whatsmeow.Client, 
 			}
 		}
 		savedName := ""
+		pushName := ""
 		if client != nil && client.Store != nil && client.Store.Contacts != nil {
 			for _, alias := range aliases {
 				contactJID, parseErr := types.ParseJID(alias)
@@ -221,6 +222,9 @@ func registerDetectorReadHandlers(mux *http.ServeMux, client *whatsmeow.Client, 
 				contact, contactErr := client.Store.Contacts.GetContact(r.Context(), contactJID)
 				if contactErr != nil {
 					continue
+				}
+				if pushName == "" {
+					pushName = contact.PushName
 				}
 				for _, name := range []string{contact.FullName, contact.FirstName} {
 					if strings.ContainsFunc(name, unicode.IsLetter) {
@@ -234,6 +238,6 @@ func registerDetectorReadHandlers(mux *http.ServeMux, client *whatsmeow.Client, 
 			}
 		}
 		writeCapabilityJSON(w, 200, capabilityResponse{Success: true, Data: map[string]any{"jid": jid.String(), "aliases": aliases, "phone_number": phone,
-			"requester_is_saved_contact": savedName != "", "saved_contact_name": savedName}})
+			"requester_is_saved_contact": savedName != "", "saved_contact_name": savedName, "push_name": pushName}})
 	})
 }
